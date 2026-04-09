@@ -1,0 +1,28 @@
+domain_id = "earth"
+chain_name = "IALP Earth Domain"
+chain_id = "ialp-earth-local"
+chain_type = "local"
+
+[token]
+symbol = "IALP"
+decimals = 12
+
+[network]
+p2p_port = 30333
+rpc_port = 9944
+prometheus_port = 9615
+bootnodes = []
+
+[epoch]
+length_seconds = 1800
+
+[[authorities]]
+name = "earth-alpha"
+account_seed = "//Alice"
+aura_seed = "//Alice"
+grandpa_seed = "//Alice"
+
+[bootstrap]
+sudo_account_seed = "//Alice"
+endowed_accounts = ["//Alice", "//Bob", "//Charlie", "//Dave"]
+

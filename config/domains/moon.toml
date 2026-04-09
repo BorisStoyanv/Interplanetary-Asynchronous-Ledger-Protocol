@@ -1,0 +1,28 @@
+domain_id = "moon"
+chain_name = "IALP Moon Domain"
+chain_id = "ialp-moon-local"
+chain_type = "local"
+
+[token]
+symbol = "IALP"
+decimals = 12
+
+[network]
+p2p_port = 30433
+rpc_port = 9954
+prometheus_port = 9616
+bootnodes = []
+
+[epoch]
+length_seconds = 1800
+
+[[authorities]]
+name = "moon-alpha"
+account_seed = "//Bob"
+aura_seed = "//Bob"
+grandpa_seed = "//Bob"
+
+[bootstrap]
+sudo_account_seed = "//Bob"
+endowed_accounts = ["//Alice", "//Bob", "//Charlie", "//Dave"]
+

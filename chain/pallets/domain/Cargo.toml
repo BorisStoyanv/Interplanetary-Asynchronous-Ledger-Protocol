@@ -1,0 +1,37 @@
+[package]
+name = "pallet-ialp-domain"
+description = "Domain identity pallet for the Interplanetary Asynchronous Ledger Protocol."
+version = "0.1.0"
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+edition.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+codec = { workspace = true }
+frame-support = { workspace = true }
+frame-system = { workspace = true }
+ialp-common-types = { workspace = true, features = ["serde"] }
+scale-info = { workspace = true }
+sp-runtime = { workspace = true }
+
+[dev-dependencies]
+sp-core = { workspace = true }
+sp-io = { workspace = true }
+
+[features]
+default = ["std"]
+std = [
+    "codec/std",
+    "frame-support/std",
+    "frame-system/std",
+    "ialp-common-types/serde",
+    "ialp-common-types/std",
+    "scale-info/std",
+    "sp-runtime/std",
+]

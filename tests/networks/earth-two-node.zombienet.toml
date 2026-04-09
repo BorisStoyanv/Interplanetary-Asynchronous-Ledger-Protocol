@@ -1,0 +1,18 @@
+# Earth two-node smoke network scaffold.
+# This file is kept as a Zombienet-oriented reference, but the authoritative
+# Phase 0 smoke check is `tests/smoke/earth_two_node.sh`.
+
+[relaychain]
+chain = "earth"
+default_command = "ialp-node"
+
+[[relaychain.nodes]]
+name = "earth-authority"
+validator = true
+args = ["--domain", "earth", "--alice"]
+
+[[relaychain.nodes]]
+name = "earth-follower"
+validator = false
+args = ["--domain", "earth", "--bob"]
+

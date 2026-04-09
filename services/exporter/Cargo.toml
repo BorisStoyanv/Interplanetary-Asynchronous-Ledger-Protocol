@@ -1,0 +1,28 @@
+[package]
+name = "ialp-summary-exporter"
+description = "Phase 2A exporter for GRANDPA-certified, storage-proven IALP epoch summary packages."
+version = "0.1.0"
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+edition.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+blake2.workspace = true
+clap.workspace = true
+codec.workspace = true
+futures.workspace = true
+hex.workspace = true
+ialp-common-config.workspace = true
+ialp-common-types = { workspace = true, features = ["serde"] }
+jsonrpsee.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["std"] }
+tokio.workspace = true
+twox-hash.workspace = true

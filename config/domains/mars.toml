@@ -1,0 +1,28 @@
+domain_id = "mars"
+chain_name = "IALP Mars Domain"
+chain_id = "ialp-mars-local"
+chain_type = "local"
+
+[token]
+symbol = "IALP"
+decimals = 12
+
+[network]
+p2p_port = 30533
+rpc_port = 9964
+prometheus_port = 9617
+bootnodes = []
+
+[epoch]
+length_seconds = 1800
+
+[[authorities]]
+name = "mars-alpha"
+account_seed = "//Charlie"
+aura_seed = "//Charlie"
+grandpa_seed = "//Charlie"
+
+[bootstrap]
+sudo_account_seed = "//Charlie"
+endowed_accounts = ["//Alice", "//Bob", "//Charlie", "//Dave"]
+

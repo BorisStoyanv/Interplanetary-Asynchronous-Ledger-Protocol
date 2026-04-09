@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  phase0:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang cmake libssl-dev pkg-config protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy, rust-src
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: SKIP_WASM_BUILD=1 cargo clippy --workspace --all-targets --locked
+
+      - name: Tests
+        run: SKIP_WASM_BUILD=1 cargo test --workspace --locked
+
+      - name: Workspace build
+        run: cargo build --workspace --locked
+
+      - name: Release node build
+        run: cargo build -p ialp-node --release --locked
+
+      - name: Config validation
+        run: cargo test -p ialp-common-config --locked loads_all_workspace_domain_configs -- --exact
+
+      - name: Two-node Earth smoke
+        run: bash tests/smoke/earth_two_node.sh
