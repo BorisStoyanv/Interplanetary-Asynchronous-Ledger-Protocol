@@ -82,6 +82,7 @@ pub struct AuthorityConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct BootstrapConfig {
     pub sudo_account_seed: String,
+    pub importer_account_seed: String,
     pub endowed_accounts: Vec<String>,
 }
 
@@ -208,6 +209,11 @@ impl DomainConfig {
         if self.bootstrap.sudo_account_seed.trim().is_empty() {
             return Err(ConfigError::Validation(
                 "bootstrap sudo account seed must not be empty".into(),
+            ));
+        }
+        if self.bootstrap.importer_account_seed.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "bootstrap importer account seed must not be empty".into(),
             ));
         }
 

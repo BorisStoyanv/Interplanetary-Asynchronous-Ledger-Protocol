@@ -11,8 +11,7 @@ pub mod pallet {
         empty_commitment_root, event_envelope_hash, fold_epoch_accumulator, seed_epoch_accumulator,
         tx_envelope_hash, DomainId, EpochId, EpochSummaryHashInput, EpochSummaryHeader,
         StagedSummaryRecord, BLOCK_ROOT_LABEL, EMPTY_HASH, EPOCH_SUMMARY_VERSION, EVENT_ROOT_LABEL,
-        EXPORT_ROOT_EMPTY_LABEL, GOVERNANCE_ROOT_EMPTY_LABEL, IMPORT_ROOT_EMPTY_LABEL,
-        TX_ROOT_LABEL,
+        GOVERNANCE_ROOT_EMPTY_LABEL, IMPORT_ROOT_EMPTY_LABEL, TX_ROOT_LABEL,
     };
     use scale_info::TypeInfo;
     use sp_runtime::{
@@ -24,6 +23,14 @@ pub mod pallet {
         fn domain_id() -> DomainId;
         fn validator_set_hash() -> [u8; 32];
         fn hash_to_bytes(hash: &Hash) -> [u8; 32];
+    }
+
+    pub trait ExportCommitmentProvider {
+        fn commit_epoch_exports(
+            epoch_id: EpochId,
+            start_block_height: u32,
+            end_block_height: u32,
+        ) -> [u8; 32];
     }
 
     #[derive(
@@ -73,6 +80,7 @@ pub mod pallet {
     pub trait Config: frame_system::Config {
         type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
         type SummaryContext: SummaryContext<Self::Hash>;
+        type ExportCommitmentProvider: ExportCommitmentProvider;
     }
 
     #[pallet::pallet]
@@ -245,6 +253,11 @@ pub mod pallet {
             };
             let domain_id = T::SummaryContext::domain_id();
             let validator_set_hash = T::SummaryContext::validator_set_hash();
+            let export_root = T::ExportCommitmentProvider::commit_epoch_exports(
+                epoch_id,
+                start_height,
+                end_height,
+            );
 
             SummarySlots::<T>::mutate(epoch_id, |maybe_slot| {
                 let Some(slot) = maybe_slot else {
@@ -266,13 +279,7 @@ pub mod pallet {
                     block_root: slot.accumulators.block_root,
                     tx_root: slot.accumulators.tx_root,
                     event_root: slot.accumulators.event_root,
-                    export_root: empty_commitment_root(
-                        EXPORT_ROOT_EMPTY_LABEL,
-                        domain_id,
-                        epoch_id,
-                        start_height,
-                        end_height,
-                    ),
+                    export_root,
                     import_root: empty_commitment_root(
                         IMPORT_ROOT_EMPTY_LABEL,
                         domain_id,
@@ -422,8 +429,9 @@ mod tests {
     use super::*;
     use frame_support::{construct_runtime, derive_impl, traits::Hooks};
     use ialp_common_types::{
-        seed_epoch_accumulator, summary_header_storage_key, DomainId, BLOCK_ROOT_LABEL, EMPTY_HASH,
-        EPOCH_SUMMARY_VERSION, EVENT_ROOT_LABEL, TX_ROOT_LABEL,
+        empty_commitment_root, seed_epoch_accumulator, summary_header_storage_key, DomainId,
+        EpochId, BLOCK_ROOT_LABEL, EMPTY_HASH, EPOCH_SUMMARY_VERSION, EVENT_ROOT_LABEL,
+        EXPORT_ROOT_EMPTY_LABEL, TX_ROOT_LABEL,
     };
     use sp_core::H256;
     use sp_runtime::{
@@ -450,6 +458,7 @@ mod tests {
     }
 
     pub struct TestSummaryContext;
+    pub struct TestExportCommitmentProvider;
 
     impl SummaryContext<H256> for TestSummaryContext {
         fn domain_id() -> DomainId {
@@ -465,9 +474,26 @@ mod tests {
         }
     }
 
+    impl ExportCommitmentProvider for TestExportCommitmentProvider {
+        fn commit_epoch_exports(
+            epoch_id: EpochId,
+            start_block_height: u32,
+            end_block_height: u32,
+        ) -> [u8; 32] {
+            empty_commitment_root(
+                EXPORT_ROOT_EMPTY_LABEL,
+                DomainId::Earth,
+                epoch_id,
+                start_block_height,
+                end_block_height,
+            )
+        }
+    }
+
     impl Config for Test {
         type RuntimeEvent = RuntimeEvent;
         type SummaryContext = TestSummaryContext;
+        type ExportCommitmentProvider = TestExportCommitmentProvider;
     }
 
     fn new_test_ext() -> sp_io::TestExternalities {

@@ -1,6 +1,6 @@
 [package]
-name = "ialp-summary-exporter"
-description = "Phase 2A exporter for GRANDPA-certified, storage-proven IALP epoch summary packages."
+name = "ialp-summary-importer"
+description = "Phase 2B importer for verifying export-proof-bearing IALP summary packages and recording remote_observed imports."
 version = "0.1.0"
 license.workspace = true
 authors.workspace = true
@@ -14,19 +14,26 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-blake2.workspace = true
 clap.workspace = true
 codec.workspace = true
-futures.workspace = true
+frame-system.workspace = true
 hex.workspace = true
 ialp-common-config.workspace = true
 ialp-common-types = { workspace = true, features = ["serde"] }
+ialp-runtime.workspace = true
 jsonrpsee.workspace = true
+pallet-ialp-transfers.workspace = true
+pallet-transaction-payment.workspace = true
+sc-consensus-grandpa.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["std"] }
+sp-consensus-grandpa.workspace = true
+sp-core.workspace = true
 sp-io.workspace = true
+sp-runtime.workspace = true
+sp-state-machine.workspace = true
+sp-storage.workspace = true
 tokio.workspace = true
-twox-hash.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

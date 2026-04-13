@@ -160,6 +160,9 @@ mod runtime {
 
     #[runtime::pallet_index(8)]
     pub type Epochs = pallet_ialp_epochs;
+
+    #[runtime::pallet_index(9)]
+    pub type Transfers = pallet_ialp_transfers;
 }
 
 const NORMAL_DISPATCH_RATIO: Perbill = Perbill::from_percent(75);
@@ -278,7 +281,44 @@ impl pallet_ialp_epochs::SummaryContext<Hash> for EpochSummaryRuntimeContext {
     }
 }
 
+pub struct EpochExportCommitmentRuntimeProvider;
+
+impl pallet_ialp_epochs::ExportCommitmentProvider for EpochExportCommitmentRuntimeProvider {
+    fn commit_epoch_exports(
+        epoch_id: ialp_common_types::EpochId,
+        start_block_height: u32,
+        end_block_height: u32,
+    ) -> [u8; 32] {
+        Transfers::commit_epoch_exports(epoch_id, start_block_height, end_block_height)
+    }
+}
+
 impl pallet_ialp_epochs::Config for Runtime {
     type RuntimeEvent = RuntimeEvent;
     type SummaryContext = EpochSummaryRuntimeContext;
+    type ExportCommitmentProvider = EpochExportCommitmentRuntimeProvider;
+}
+
+pub struct TransferDomainIdentityRuntimeProvider;
+
+impl pallet_ialp_transfers::DomainIdentityProvider for TransferDomainIdentityRuntimeProvider {
+    fn domain_id() -> ialp_common_types::DomainId {
+        Domain::domain_id()
+    }
+}
+
+pub struct TransferEpochInfoRuntimeProvider;
+
+impl pallet_ialp_transfers::EpochInfoProvider for TransferEpochInfoRuntimeProvider {
+    fn current_epoch() -> ialp_common_types::EpochId {
+        Epochs::current_epoch()
+    }
+}
+
+impl pallet_ialp_transfers::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type Currency = Balances;
+    type RuntimeHoldReason = RuntimeHoldReason;
+    type DomainIdentity = TransferDomainIdentityRuntimeProvider;
+    type EpochInfo = TransferEpochInfoRuntimeProvider;
 }

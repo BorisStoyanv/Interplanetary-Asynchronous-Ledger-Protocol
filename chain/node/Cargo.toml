@@ -29,6 +29,7 @@ pallet-aura.workspace = true
 pallet-grandpa.workspace = true
 pallet-ialp-domain.workspace = true
 pallet-ialp-epochs.workspace = true
+pallet-ialp-transfers.workspace = true
 pallet-transaction-payment-rpc.workspace = true
 sc-basic-authorship.workspace = true
 sc-cli.workspace = true

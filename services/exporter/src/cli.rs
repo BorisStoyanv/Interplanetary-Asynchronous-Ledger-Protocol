@@ -5,7 +5,9 @@ use ialp_common_types::{DomainId, EpochId};
 
 #[derive(Debug, Parser)]
 #[command(name = "ialp-summary-exporter")]
-#[command(about = "Phase 2A exporter for GRANDPA-certified, storage-proven IALP summary packages.")]
+#[command(
+    about = "Phase 2B exporter for GRANDPA-certified, storage-proven IALP summary packages with export inclusion proofs."
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -46,6 +48,8 @@ pub struct StatusArgs {
     #[arg(long)]
     pub epoch: Option<EpochId>,
     #[arg(long)]
+    pub target_domain: Option<DomainId>,
+    #[arg(long)]
     pub json: bool,
 }
 
@@ -57,6 +61,8 @@ pub struct ShowArgs {
     pub store_dir: PathBuf,
     #[arg(long)]
     pub epoch: EpochId,
+    #[arg(long)]
+    pub target_domain: DomainId,
     #[arg(long)]
     pub json: bool,
 }

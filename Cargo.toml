@@ -10,10 +10,12 @@ members = [
     "chain/node",
     "chain/pallets/domain",
     "chain/pallets/epochs",
+    "chain/pallets/transfers",
     "chain/runtime",
     "crates/common-config",
     "crates/common-types",
     "services/exporter",
+    "services/importer",
 ]
 resolver = "2"
 
@@ -44,6 +46,7 @@ ialp-common-types = { path = "./crates/common-types", default-features = false }
 ialp-runtime = { path = "./chain/runtime", default-features = false }
 pallet-ialp-domain = { path = "./chain/pallets/domain", default-features = false }
 pallet-ialp-epochs = { path = "./chain/pallets/epochs", default-features = false }
+pallet-ialp-transfers = { path = "./chain/pallets/transfers", default-features = false }
 
 anyhow = "1.0.95"
 blake2 = "0.10.6"
@@ -56,6 +59,7 @@ multiaddr = "0.18.2"
 scale-info = { version = "2.11.6", default-features = false, features = ["derive"] }
 serde = { version = "1.0.217", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1.0.132", default-features = false, features = ["alloc"] }
+tempfile = "3.16.0"
 thiserror = "2.0.11"
 tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "signal", "time"] }
 toml = "0.8.19"
@@ -101,6 +105,7 @@ sp-offchain = { version = "=36.0.0", default-features = false }
 sp-runtime = { version = "=41.1.0", default-features = false }
 sp-session = { version = "=38.1.0", default-features = false }
 sp-state-machine = { version = "=0.45.0", default-features = false }
+sp-std = { version = "=14.0.0", default-features = false }
 sp-storage = { version = "=22.0.0", default-features = false }
 sp-timestamp = { version = "=36.0.0", default-features = false }
 sp-transaction-pool = { version = "=36.0.0", default-features = false }

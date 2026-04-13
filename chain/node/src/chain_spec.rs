@@ -87,6 +87,7 @@ fn genesis_patch(loaded: &LoadedDomainConfig) -> Result<Value, String> {
         .collect::<Vec<_>>();
 
     let root_key = get_account_id_from_seed(&loaded.config.bootstrap.sudo_account_seed);
+    let importer_account = get_account_id_from_seed(&loaded.config.bootstrap.importer_account_seed);
 
     let mut endowed_accounts = loaded
         .config
@@ -104,6 +105,12 @@ fn genesis_patch(loaded: &LoadedDomainConfig) -> Result<Value, String> {
         {
             endowed_accounts.push((authority_account, 1u128 << 60));
         }
+    }
+    if !endowed_accounts
+        .iter()
+        .any(|(account, _)| account == &importer_account)
+    {
+        endowed_accounts.push((importer_account.clone(), 1u128 << 60));
     }
 
     Ok(build_struct_json_patch!(
@@ -129,6 +136,9 @@ fn genesis_patch(loaded: &LoadedDomainConfig) -> Result<Value, String> {
             domain: pallet_ialp_domain::GenesisConfig { chain_identity },
             epochs: pallet_ialp_epochs::GenesisConfig {
                 epoch_length_blocks,
+            },
+            transfers: pallet_ialp_transfers::GenesisConfig {
+                importer_account: Some(importer_account),
             },
         }
     ))

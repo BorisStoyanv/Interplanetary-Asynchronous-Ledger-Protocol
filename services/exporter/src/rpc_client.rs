@@ -1,11 +1,8 @@
 use anyhow::{anyhow, bail, Context};
-use blake2::{
-    digest::{Update, VariableOutput},
-    Blake2bVar,
-};
 use codec::{Decode, Encode};
 use ialp_common_types::{
-    summary_header_storage_key, EpochId, EpochSummaryHeader, SummaryCertificationReadiness,
+    epoch_export_ids_storage_key, export_record_storage_key, summary_header_storage_key, EpochId,
+    EpochSummaryHeader, ExportId, ExportRecord, SummaryCertificationReadiness,
 };
 use jsonrpsee::{
     core::{
@@ -14,21 +11,19 @@ use jsonrpsee::{
     },
     ws_client::{WsClient, WsClientBuilder},
 };
-use std::hash::Hasher;
-use twox_hash::XxHash64;
 
 pub struct NodeRpcClient {
     client: WsClient,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decode, Default)]
 enum SummarySlotStatus {
     #[default]
     Reserved,
     Staged,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Decode, Default)]
 struct EpochAccumulators {
     state_root: [u8; 32],
     block_root: [u8; 32],
@@ -38,7 +33,7 @@ struct EpochAccumulators {
     last_observed_block: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Decode, Default)]
 struct SummarySlotRecord {
     epoch_id: EpochId,
     start_height: u32,
@@ -65,6 +60,7 @@ impl StagedSummaryView {
             "staged_at_block_number": self.staged_at_block_number,
             "start_block_height": self.header.start_block_height,
             "end_block_height": self.header.end_block_height,
+            "export_root": format!("0x{}", hex::encode(self.header.export_root)),
         })
     }
 }
@@ -140,6 +136,31 @@ impl NodeRpcClient {
             .context("failed to subscribe to finalized heads")
     }
 
+    pub async fn epoch_export_ids(&self, epoch_id: EpochId) -> anyhow::Result<Vec<ExportId>> {
+        Ok(self
+            .load_storage_value::<Vec<ExportId>>(epoch_export_ids_storage_key(epoch_id))
+            .await?
+            .unwrap_or_default())
+    }
+
+    pub async fn export_record(&self, export_id: ExportId) -> anyhow::Result<Option<ExportRecord>> {
+        self.load_storage_value::<ExportRecord>(export_record_storage_key(export_id))
+            .await
+    }
+
+    pub async fn epoch_exports(&self, epoch_id: EpochId) -> anyhow::Result<Vec<ExportRecord>> {
+        let export_ids = self.epoch_export_ids(epoch_id).await?;
+        let mut exports = Vec::with_capacity(export_ids.len());
+        for export_id in export_ids {
+            let record = self
+                .export_record(export_id)
+                .await?
+                .ok_or_else(|| anyhow!("missing export record 0x{}", hex::encode(export_id)))?;
+            exports.push(record);
+        }
+        Ok(exports)
+    }
+
     async fn load_storage_value<T: Decode>(&self, key: Vec<u8>) -> anyhow::Result<Option<T>> {
         let hex_key = format!("0x{}", hex::encode(key));
         let response: Option<String> = self
@@ -158,50 +179,20 @@ impl NodeRpcClient {
 }
 
 fn latest_summary_header_storage_key() -> Vec<u8> {
-    storage_prefix(b"Epochs", b"LatestSummaryHeader")
-}
-
-fn summary_slot_storage_key(epoch_id: EpochId) -> Vec<u8> {
-    let mut key = storage_prefix(b"Epochs", b"SummarySlots");
-    key.extend(blake2_128_concat(&epoch_id.encode()));
+    let mut key = Vec::with_capacity(32);
+    key.extend_from_slice(&sp_io::hashing::twox_128(b"Epochs"));
+    key.extend_from_slice(&sp_io::hashing::twox_128(b"LatestSummaryHeader"));
     key
 }
 
-fn storage_prefix(pallet: &[u8], storage: &[u8]) -> Vec<u8> {
-    let mut prefix = Vec::with_capacity(32);
-    prefix.extend_from_slice(&twox_128(pallet));
-    prefix.extend_from_slice(&twox_128(storage));
-    prefix
-}
-
-fn blake2_128_concat(data: &[u8]) -> Vec<u8> {
-    let mut output = Vec::with_capacity(16 + data.len());
-    output.extend_from_slice(&blake2_128(data));
-    output.extend_from_slice(data);
-    output
-}
-
-fn blake2_128(data: &[u8]) -> [u8; 16] {
-    let mut output = [0u8; 16];
-    let mut hasher = Blake2bVar::new(output.len()).expect("blake2 output length is valid");
-    hasher.update(data);
-    hasher
-        .finalize_variable(&mut output)
-        .expect("output buffer length matches configured digest length");
-    output
-}
-
-fn twox_128(data: &[u8]) -> [u8; 16] {
-    let mut output = [0u8; 16];
-    output[..8].copy_from_slice(&twox_64_with_seed(data, 0).to_le_bytes());
-    output[8..].copy_from_slice(&twox_64_with_seed(data, 1).to_le_bytes());
-    output
-}
-
-fn twox_64_with_seed(data: &[u8], seed: u64) -> u64 {
-    let mut hasher = XxHash64::with_seed(seed);
-    hasher.write(data);
-    hasher.finish()
+fn summary_slot_storage_key(epoch_id: EpochId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(64);
+    key.extend_from_slice(&sp_io::hashing::twox_128(b"Epochs"));
+    key.extend_from_slice(&sp_io::hashing::twox_128(b"SummarySlots"));
+    let encoded = epoch_id.encode();
+    key.extend_from_slice(&sp_io::hashing::blake2_128(&encoded));
+    key.extend_from_slice(&encoded);
+    key
 }
 
 fn decode_hex_bytes(value: &str) -> anyhow::Result<Vec<u8>> {
@@ -212,15 +203,49 @@ fn decode_hex_bytes(value: &str) -> anyhow::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ialp_common_types::{observed_import_storage_key, DomainId};
 
     #[test]
-    fn storage_keys_are_distinct_for_slot_and_header() {
-        assert_ne!(summary_header_storage_key(1), summary_slot_storage_key(1));
+    fn transfer_storage_keys_are_distinct() {
+        let export_id = [7u8; 32];
+        assert_ne!(
+            epoch_export_ids_storage_key(3),
+            export_record_storage_key(export_id)
+        );
+        assert_ne!(
+            export_record_storage_key(export_id),
+            observed_import_storage_key(export_id)
+        );
     }
 
     #[test]
-    fn decodes_hex_storage_response() {
-        let bytes = decode_hex_bytes("0x010203").expect("hex should decode");
-        assert_eq!(bytes, vec![1, 2, 3]);
+    fn staged_summary_json_includes_export_root() {
+        let summary = StagedSummaryView {
+            header: EpochSummaryHeader {
+                version: 1,
+                domain_id: DomainId::Earth,
+                epoch_id: 4,
+                prev_summary_hash: [0u8; 32],
+                start_block_height: 1,
+                end_block_height: 3,
+                state_root: [1u8; 32],
+                block_root: [2u8; 32],
+                tx_root: [3u8; 32],
+                event_root: [4u8; 32],
+                export_root: [5u8; 32],
+                import_root: [6u8; 32],
+                governance_root: [7u8; 32],
+                validator_set_hash: [8u8; 32],
+                summary_hash: [9u8; 32],
+            },
+            staged_at_block_number: 4,
+        };
+
+        let json = summary.json_summary();
+        assert_eq!(json["epoch_id"], 4);
+        assert_eq!(
+            json["export_root"],
+            serde_json::Value::String(format!("0x{}", hex::encode([5u8; 32])))
+        );
     }
 }

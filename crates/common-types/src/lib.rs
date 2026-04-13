@@ -4,7 +4,7 @@ extern crate alloc;
 
 use alloc::{vec, vec::Vec};
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
-use core::{fmt, str::FromStr};
+use core::{cmp::Ordering, fmt, str::FromStr};
 use scale_info::TypeInfo;
 use sp_io::hashing::{blake2_128, blake2_256, twox_128};
 
@@ -28,7 +28,16 @@ pub const GOVERNANCE_ROOT_EMPTY_LABEL: &str = "IALP:governance-root:empty:v1";
 pub const CERTIFIED_SUMMARY_PACKAGE_VERSION: u16 = 1;
 pub const GRANDPA_FINALITY_CERTIFICATE_VERSION: u16 = 1;
 pub const SUMMARY_HEADER_STORAGE_PROOF_VERSION: u16 = 1;
+pub const EXPORT_LEAF_VERSION: u16 = 1;
+pub const OBSERVED_IMPORT_VERSION: u16 = 1;
+pub const EXPORT_INCLUSION_PROOF_VERSION: u16 = 1;
 pub const SUMMARY_HEADERS_PROOF_INDEX: usize = 0;
+pub const EXPORT_PROOF_START_INDEX: usize = 1;
+pub const EXPORT_MERKLE_NODE_LABEL: &str = "IALP:export-merkle-node:v1";
+pub const EXPORT_MERKLE_EMPTY_LABEL: &str = "IALP:export-merkle-empty:v1";
+
+pub type ExportId = [u8; 32];
+pub type AccountIdBytes = [u8; 32];
 
 #[derive(
     Clone,
@@ -348,14 +357,255 @@ pub struct StagedSummaryRecord {
     pub staged_at_block_number: u32,
 }
 
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    TypeInfo,
+    MaxEncodedLen,
+    Default,
+)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum ExportStatus {
+    #[default]
+    LocalFinal,
+    Exported,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    TypeInfo,
+    MaxEncodedLen,
+    Default,
+)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum ImportObservationStatus {
+    #[default]
+    RemoteObserved,
+}
+
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    TypeInfo,
+    MaxEncodedLen,
+    Default,
+)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ExportLeafHashInput {
+    pub version: u16,
+    pub export_id: ExportId,
+    pub source_domain: DomainId,
+    pub target_domain: DomainId,
+    pub sender: AccountIdBytes,
+    pub recipient: AccountIdBytes,
+    pub amount: u128,
+    pub source_epoch_id: EpochId,
+    pub source_block_height: u32,
+    pub extrinsic_index: u32,
+}
+
+impl ExportLeafHashInput {
+    pub fn export_hash(&self) -> [u8; 32] {
+        blake2_256(&self.encode())
+    }
+}
+
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    TypeInfo,
+    MaxEncodedLen,
+    Default,
+)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ExportLeaf {
+    pub version: u16,
+    pub export_id: ExportId,
+    pub source_domain: DomainId,
+    pub target_domain: DomainId,
+    pub sender: AccountIdBytes,
+    pub recipient: AccountIdBytes,
+    pub amount: u128,
+    pub source_epoch_id: EpochId,
+    pub source_block_height: u32,
+    pub extrinsic_index: u32,
+    pub export_hash: [u8; 32],
+}
+
+impl ExportLeaf {
+    pub fn from_hash_input(input: ExportLeafHashInput) -> Self {
+        Self {
+            version: input.version,
+            export_id: input.export_id,
+            source_domain: input.source_domain,
+            target_domain: input.target_domain,
+            sender: input.sender,
+            recipient: input.recipient,
+            amount: input.amount,
+            source_epoch_id: input.source_epoch_id,
+            source_block_height: input.source_block_height,
+            extrinsic_index: input.extrinsic_index,
+            export_hash: input.export_hash(),
+        }
+    }
+
+    pub fn hash_input(&self) -> ExportLeafHashInput {
+        ExportLeafHashInput {
+            version: self.version,
+            export_id: self.export_id,
+            source_domain: self.source_domain,
+            target_domain: self.target_domain,
+            sender: self.sender,
+            recipient: self.recipient,
+            amount: self.amount,
+            source_epoch_id: self.source_epoch_id,
+            source_block_height: self.source_block_height,
+            extrinsic_index: self.extrinsic_index,
+        }
+    }
+
+    pub fn compute_export_hash(&self) -> [u8; 32] {
+        self.hash_input().export_hash()
+    }
+}
+
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    TypeInfo,
+    MaxEncodedLen,
+    Default,
+)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ExportRecord {
+    pub leaf: ExportLeaf,
+    pub status: ExportStatus,
+}
+
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    TypeInfo,
+    MaxEncodedLen,
+    Default,
+)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ObservedImportClaim {
+    pub version: u16,
+    pub export_id: ExportId,
+    pub source_domain: DomainId,
+    pub target_domain: DomainId,
+    pub source_epoch_id: EpochId,
+    pub summary_hash: [u8; 32],
+    pub package_hash: [u8; 32],
+    pub recipient: AccountIdBytes,
+    pub amount: u128,
+}
+
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    TypeInfo,
+    MaxEncodedLen,
+    Default,
+)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ObservedImportRecord {
+    pub version: u16,
+    pub export_id: ExportId,
+    pub source_domain: DomainId,
+    pub target_domain: DomainId,
+    pub source_epoch_id: EpochId,
+    pub summary_hash: [u8; 32],
+    pub package_hash: [u8; 32],
+    pub recipient: AccountIdBytes,
+    pub amount: u128,
+    pub observed_at_local_block_height: u32,
+    pub observer_account: AccountIdBytes,
+    pub status: ImportObservationStatus,
+}
+
+impl ObservedImportRecord {
+    pub fn from_claim(
+        claim: ObservedImportClaim,
+        observed_at_local_block_height: u32,
+        observer_account: AccountIdBytes,
+    ) -> Self {
+        Self {
+            version: claim.version,
+            export_id: claim.export_id,
+            source_domain: claim.source_domain,
+            target_domain: claim.target_domain,
+            source_epoch_id: claim.source_epoch_id,
+            summary_hash: claim.summary_hash,
+            package_hash: claim.package_hash,
+            recipient: claim.recipient,
+            amount: claim.amount,
+            observed_at_local_block_height,
+            observer_account,
+            status: ImportObservationStatus::RemoteObserved,
+        }
+    }
+}
+
 pub fn summary_header_storage_key(epoch_id: EpochId) -> Vec<u8> {
-    let encoded_epoch = epoch_id.encode();
-    let mut key = Vec::with_capacity(32 + 16 + encoded_epoch.len());
-    key.extend_from_slice(&twox_128(b"Epochs"));
-    key.extend_from_slice(&twox_128(b"SummaryHeaders"));
-    key.extend_from_slice(&blake2_128(&encoded_epoch));
-    key.extend_from_slice(&encoded_epoch);
-    key
+    storage_map_key(b"Epochs", b"SummaryHeaders", &epoch_id.encode())
+}
+
+pub fn epoch_export_ids_storage_key(epoch_id: EpochId) -> Vec<u8> {
+    storage_map_key(b"Transfers", b"EpochExportIds", &epoch_id.encode())
+}
+
+pub fn export_record_storage_key(export_id: ExportId) -> Vec<u8> {
+    storage_map_key(b"Transfers", b"ExportsById", &export_id.encode())
+}
+
+pub fn observed_import_storage_key(export_id: ExportId) -> Vec<u8> {
+    storage_map_key(b"Transfers", b"ObservedImportsById", &export_id.encode())
+}
+
+pub fn importer_account_storage_key() -> Vec<u8> {
+    storage_value_key(b"Transfers", b"ImporterAccount")
 }
 
 #[derive(
@@ -406,10 +656,21 @@ impl SummaryHeaderStorageProof {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ExportInclusionProof {
+    pub version: u16,
+    pub leaf: ExportLeaf,
+    pub leaf_index: u32,
+    pub leaf_count: u32,
+    pub siblings: Vec<[u8; 32]>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum InclusionProof {
     SummaryHeaderStorageV1(SummaryHeaderStorageProof),
+    ExportV1(ExportInclusionProof),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo, Default)]
@@ -509,15 +770,26 @@ impl CertifiedSummaryPackage {
     }
 
     pub fn from_bundle(header: EpochSummaryHeader, bundle: SummaryCertificationBundle) -> Self {
-        Self::from_fields(
-            header,
-            bundle.certificate,
+        Self::from_bundle_with_export_proofs(header, bundle, Vec::new())
+    }
+
+    pub fn from_bundle_with_export_proofs(
+        header: EpochSummaryHeader,
+        bundle: SummaryCertificationBundle,
+        export_proofs: Vec<ExportInclusionProof>,
+    ) -> Self {
+        let mut inclusion_proofs =
             vec![
                 InclusionProof::SummaryHeaderStorageV1(bundle.summary_header_storage_proof)
                     .encode(),
-            ],
-            Vec::new(),
-        )
+            ];
+        inclusion_proofs.extend(
+            export_proofs
+                .into_iter()
+                .map(InclusionProof::ExportV1)
+                .map(|proof| proof.encode()),
+        );
+        Self::from_fields(header, bundle.certificate, inclusion_proofs, Vec::new())
     }
 
     pub fn hash_input(&self) -> CertifiedSummaryPackageHashInput {
@@ -539,6 +811,170 @@ pub fn fixed_bytes<const N: usize>(value: &[u8]) -> [u8; N] {
     let mut output = [0u8; N];
     output[..value.len()].copy_from_slice(value);
     output
+}
+
+pub fn export_id(source_domain: DomainId, export_sequence: u64) -> ExportId {
+    blake2_256(&(source_domain, export_sequence).encode())
+}
+
+pub fn export_leaf_ordering(left: &ExportLeaf, right: &ExportLeaf) -> Ordering {
+    left.source_block_height
+        .cmp(&right.source_block_height)
+        .then(left.extrinsic_index.cmp(&right.extrinsic_index))
+        .then(left.export_id.cmp(&right.export_id))
+}
+
+pub fn sort_export_leaves(leaves: &mut [ExportLeaf]) {
+    leaves.sort_by(export_leaf_ordering);
+}
+
+pub fn export_merkle_empty_root(
+    domain_id: DomainId,
+    epoch_id: EpochId,
+    start_block_height: u32,
+    end_block_height: u32,
+) -> [u8; 32] {
+    blake2_256(
+        &(
+            EXPORT_MERKLE_EMPTY_LABEL,
+            domain_id,
+            epoch_id,
+            start_block_height,
+            end_block_height,
+        )
+            .encode(),
+    )
+}
+
+pub fn export_merkle_root(
+    domain_id: DomainId,
+    epoch_id: EpochId,
+    start_block_height: u32,
+    end_block_height: u32,
+    leaves: &[ExportLeaf],
+) -> [u8; 32] {
+    let mut ordered = leaves.to_vec();
+    sort_export_leaves(&mut ordered);
+
+    if ordered.is_empty() {
+        return export_merkle_empty_root(domain_id, epoch_id, start_block_height, end_block_height);
+    }
+
+    let mut level = ordered
+        .iter()
+        .map(|leaf| leaf.export_hash)
+        .collect::<Vec<_>>();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        let mut index = 0usize;
+        while index < level.len() {
+            let left = level[index];
+            let right = if index + 1 < level.len() {
+                level[index + 1]
+            } else {
+                left
+            };
+            next.push(export_merkle_parent_hash(left, right));
+            index += 2;
+        }
+        level = next;
+    }
+
+    level[0]
+}
+
+pub fn build_export_inclusion_proof(
+    leaves: &[ExportLeaf],
+    export_id: ExportId,
+) -> Option<ExportInclusionProof> {
+    let mut ordered = leaves.to_vec();
+    sort_export_leaves(&mut ordered);
+
+    let leaf_index = ordered
+        .iter()
+        .position(|leaf| leaf.export_id == export_id)?;
+    let leaf_count = ordered.len();
+    let mut siblings = Vec::new();
+    let mut index = leaf_index;
+    let mut level = ordered
+        .iter()
+        .map(|leaf| leaf.export_hash)
+        .collect::<Vec<_>>();
+
+    while level.len() > 1 {
+        let sibling_index = if index % 2 == 0 {
+            if index + 1 < level.len() {
+                index + 1
+            } else {
+                index
+            }
+        } else {
+            index - 1
+        };
+        siblings.push(level[sibling_index]);
+
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        let mut pair_index = 0usize;
+        while pair_index < level.len() {
+            let left = level[pair_index];
+            let right = if pair_index + 1 < level.len() {
+                level[pair_index + 1]
+            } else {
+                left
+            };
+            next.push(export_merkle_parent_hash(left, right));
+            pair_index += 2;
+        }
+        index /= 2;
+        level = next;
+    }
+
+    Some(ExportInclusionProof {
+        version: EXPORT_INCLUSION_PROOF_VERSION,
+        leaf: ordered[leaf_index].clone(),
+        leaf_index: leaf_index as u32,
+        leaf_count: leaf_count as u32,
+        siblings,
+    })
+}
+
+pub fn verify_export_inclusion_proof(export_root: [u8; 32], proof: &ExportInclusionProof) -> bool {
+    if proof.leaf.export_hash != proof.leaf.compute_export_hash() {
+        return false;
+    }
+    if proof.leaf_count == 0 || proof.leaf_index >= proof.leaf_count {
+        return false;
+    }
+
+    let mut index = proof.leaf_index as usize;
+    let mut width = proof.leaf_count as usize;
+    let mut hash = proof.leaf.export_hash;
+
+    if width == 1 {
+        return hash == export_root && proof.siblings.is_empty();
+    }
+
+    for sibling in &proof.siblings {
+        let sibling_hash = *sibling;
+        let is_right_duplicate = width % 2 == 1 && index == width - 1;
+        let (left, right) = if index.is_multiple_of(2) {
+            (
+                hash,
+                if is_right_duplicate {
+                    hash
+                } else {
+                    sibling_hash
+                },
+            )
+        } else {
+            (sibling_hash, hash)
+        };
+        hash = export_merkle_parent_hash(left, right);
+        index /= 2;
+        width = width.div_ceil(2);
+    }
+
+    hash == export_root
 }
 
 pub fn seed_epoch_accumulator(label: &str, domain_id: DomainId, epoch_id: EpochId) -> [u8; 32] {
@@ -590,6 +1026,24 @@ pub fn validator_set_hash<Authorities: Encode>(
     ordered_grandpa_authorities: &Authorities,
 ) -> [u8; 32] {
     blake2_256(&(grandpa_set_id, ordered_grandpa_authorities).encode())
+}
+
+pub fn export_merkle_parent_hash(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
+    blake2_256(&(EXPORT_MERKLE_NODE_LABEL, left, right).encode())
+}
+
+pub fn storage_value_key(pallet: &[u8], storage: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(32);
+    key.extend_from_slice(&twox_128(pallet));
+    key.extend_from_slice(&twox_128(storage));
+    key
+}
+
+pub fn storage_map_key(pallet: &[u8], storage: &[u8], encoded_key: &[u8]) -> Vec<u8> {
+    let mut key = storage_value_key(pallet, storage);
+    key.extend_from_slice(&blake2_128(encoded_key));
+    key.extend_from_slice(encoded_key);
+    key
 }
 
 #[cfg(test)]
@@ -697,6 +1151,26 @@ mod tests {
         }
     }
 
+    fn sample_export_leaf(
+        export_id: ExportId,
+        target_domain: DomainId,
+        source_block_height: u32,
+        extrinsic_index: u32,
+    ) -> ExportLeaf {
+        ExportLeaf::from_hash_input(ExportLeafHashInput {
+            version: EXPORT_LEAF_VERSION,
+            export_id,
+            source_domain: DomainId::Earth,
+            target_domain,
+            sender: [21u8; 32],
+            recipient: [22u8; 32],
+            amount: 99,
+            source_epoch_id: 7,
+            source_block_height,
+            extrinsic_index,
+        })
+    }
+
     #[test]
     fn summary_header_storage_key_is_deterministic() {
         assert_eq!(summary_header_storage_key(7), summary_header_storage_key(7));
@@ -746,6 +1220,73 @@ mod tests {
                 certificate: sample_certificate(),
                 summary_header_storage_proof: changed_proof,
             },
+        );
+
+        assert_ne!(first.package_hash, second.package_hash);
+    }
+
+    #[test]
+    fn export_leaf_hash_is_deterministic() {
+        let first = sample_export_leaf([31u8; 32], DomainId::Moon, 50, 0);
+        let second = sample_export_leaf([31u8; 32], DomainId::Moon, 50, 0);
+
+        assert_eq!(first.export_hash, second.export_hash);
+        assert_eq!(first.export_hash, first.compute_export_hash());
+    }
+
+    #[test]
+    fn export_merkle_root_is_deterministic_and_proof_verifies() {
+        let leaves = vec![
+            sample_export_leaf([40u8; 32], DomainId::Moon, 52, 1),
+            sample_export_leaf([39u8; 32], DomainId::Moon, 51, 0),
+            sample_export_leaf([41u8; 32], DomainId::Mars, 52, 2),
+        ];
+        let root = export_merkle_root(DomainId::Earth, 7, 41, 60, &leaves);
+        let same_root = export_merkle_root(DomainId::Earth, 7, 41, 60, &leaves);
+        let proof = build_export_inclusion_proof(&leaves, [39u8; 32]).expect("proof");
+
+        assert_eq!(root, same_root);
+        assert!(verify_export_inclusion_proof(root, &proof));
+    }
+
+    #[test]
+    fn export_proof_round_trips_as_export_v1() {
+        let proof = build_export_inclusion_proof(
+            &[
+                sample_export_leaf([50u8; 32], DomainId::Moon, 60, 0),
+                sample_export_leaf([51u8; 32], DomainId::Moon, 60, 1),
+            ],
+            [50u8; 32],
+        )
+        .expect("proof");
+        let encoded = InclusionProof::ExportV1(proof.clone()).encode();
+        let decoded = InclusionProof::decode(&mut &encoded[..]).expect("proof should decode");
+
+        assert_eq!(decoded, InclusionProof::ExportV1(proof));
+    }
+
+    #[test]
+    fn changing_export_proof_changes_package_hash() {
+        let header = EpochSummaryHeader::from_hash_input(sample_hash_input());
+        let bundle = SummaryCertificationBundle {
+            certificate: sample_certificate(),
+            summary_header_storage_proof: sample_storage_proof(),
+        };
+        let leaves = vec![
+            sample_export_leaf([61u8; 32], DomainId::Moon, 61, 0),
+            sample_export_leaf([62u8; 32], DomainId::Moon, 61, 1),
+        ];
+        let first = CertifiedSummaryPackage::from_bundle_with_export_proofs(
+            header.clone(),
+            bundle.clone(),
+            vec![build_export_inclusion_proof(&leaves, [61u8; 32]).expect("proof")],
+        );
+        let mut changed_proof = build_export_inclusion_proof(&leaves, [61u8; 32]).expect("proof");
+        changed_proof.siblings[0][0] ^= 0xFF;
+        let second = CertifiedSummaryPackage::from_bundle_with_export_proofs(
+            header,
+            bundle,
+            vec![changed_proof],
         );
 
         assert_ne!(first.package_hash, second.package_hash);
