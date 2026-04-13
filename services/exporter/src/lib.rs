@@ -1,22 +1,32 @@
 mod cli;
+mod relay_client;
 mod rpc_client;
 mod store;
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{bail, Context};
 use clap::Parser;
-use ialp_common_config::load_domain_config;
+use codec::Encode;
+use ialp_common_config::{load_domain_config, load_transport_config};
 use ialp_common_types::{
     build_export_inclusion_proof, export_merkle_root, sort_export_leaves, CertifiedSummaryPackage,
-    DomainId, ExportLeaf, SummaryCertificate, SummaryCertificationReadiness,
-    SummaryCertificationState,
+    DomainId, ExportLeaf, RelayPackageEnvelopeV1, SummaryCertificate,
+    SummaryCertificationReadiness, SummaryCertificationState,
 };
 
 use crate::{
     cli::{Cli, Commands},
+    relay_client::{ensure_submission_succeeded, RelayHttpClient},
     rpc_client::{NodeRpcClient, StagedSummaryView},
-    store::{decode_export_proofs, decode_summary_header_storage_proof, PackageRecord, Store},
+    store::{
+        decode_export_proofs, decode_summary_header_storage_proof, PackageRecord,
+        RelaySubmissionState, Store,
+    },
 };
 
 pub async fn run_cli() -> anyhow::Result<()> {
@@ -30,22 +40,37 @@ pub async fn run_cli() -> anyhow::Result<()> {
 }
 
 async fn run_exporter(args: cli::RunArgs) -> anyhow::Result<()> {
-    let settings = ExporterSettings::load(args.domain, args.config, args.node_url, args.store_dir)?;
+    let settings = ExporterSettings::load(
+        args.domain,
+        args.config,
+        args.transport_config,
+        args.node_url,
+        args.relay_url,
+        args.store_dir,
+    )?;
     let rpc = NodeRpcClient::connect(&settings.node_url).await?;
+    let relay = RelayHttpClient::new(&settings.relay_url)?;
     let store = Store::new(settings.store_dir.clone(), settings.domain)?;
 
-    sync_once(&rpc, &store).await?;
+    sync_once(&rpc, &relay, &store).await?;
 
     let mut finalized_heads = rpc.subscribe_finalized_heads().await?;
     while finalized_heads.next().await.transpose()?.is_some() {
-        sync_once(&rpc, &store).await?;
+        sync_once(&rpc, &relay, &store).await?;
     }
 
     Ok(())
 }
 
 async fn show_status(args: cli::StatusArgs) -> anyhow::Result<()> {
-    let settings = ExporterSettings::load(args.domain, args.config, args.node_url, args.store_dir)?;
+    let settings = ExporterSettings::load(
+        args.domain,
+        args.config,
+        None,
+        args.node_url,
+        None,
+        args.store_dir,
+    )?;
     let rpc = NodeRpcClient::connect(&settings.node_url).await?;
     let store = Store::new(settings.store_dir.clone(), settings.domain)?;
     let index = store.load_index()?;
@@ -158,7 +183,11 @@ fn show_package(args: cli::ShowArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn sync_once(rpc: &NodeRpcClient, store: &Store) -> anyhow::Result<()> {
+async fn sync_once(
+    rpc: &NodeRpcClient,
+    relay: &RelayHttpClient,
+    store: &Store,
+) -> anyhow::Result<()> {
     let latest_staged = rpc.latest_staged_summary().await?;
     let mut index = store.load_index()?;
     index.latest_staged_epoch = latest_staged
@@ -250,7 +279,53 @@ async fn sync_once(rpc: &NodeRpcClient, store: &Store) -> anyhow::Result<()> {
         }
     }
 
+    submit_certified_packages_to_relay(relay, store, &mut index).await?;
     store.save_index(&index)?;
+    Ok(())
+}
+
+async fn submit_certified_packages_to_relay(
+    relay: &RelayHttpClient,
+    store: &Store,
+    index: &mut store::ExporterIndex,
+) -> anyhow::Result<()> {
+    let records = index.packages.clone();
+    for record in records.into_iter().filter(|record| {
+        record.status == store::PackageStatus::Certified
+            && record.relay_submission_state != RelaySubmissionState::Submitted
+    }) {
+        let now = unix_now_millis()?;
+        let (_, package) = store.load_package(record.epoch_id, record.target_domain)?;
+        let export_count = u32::try_from(record.export_count)
+            .context("export_count does not fit into u32 for relay envelope")?;
+        let envelope = RelayPackageEnvelopeV1::new(
+            package.header.domain_id,
+            record.target_domain,
+            package.header.epoch_id,
+            package.header.summary_hash,
+            package.package_hash,
+            package.encode(),
+            export_count,
+            now,
+        );
+
+        match relay.submit_package(&envelope).await {
+            Ok(receipt) => {
+                ensure_submission_succeeded(&receipt)?;
+                let _ = receipt.idempotent;
+                index.mark_relay_submitted(record.epoch_id, record.target_domain, now);
+            }
+            Err(error) => {
+                index.mark_relay_submission_error(
+                    record.epoch_id,
+                    record.target_domain,
+                    now,
+                    error.retryable,
+                    error.message,
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -320,6 +395,7 @@ fn hex_bytes(bytes: &[u8]) -> String {
 struct ExporterSettings {
     domain: DomainId,
     node_url: String,
+    relay_url: String,
     store_dir: PathBuf,
 }
 
@@ -327,22 +403,38 @@ impl ExporterSettings {
     fn load(
         domain: DomainId,
         config: Option<PathBuf>,
+        transport_config: Option<PathBuf>,
         node_url: Option<String>,
+        relay_url: Option<String>,
         store_dir: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
         let loaded = load_domain_config(domain, config.as_deref())
             .with_context(|| format!("failed to load exporter config for domain {domain}"))?;
+        let loaded_transport = load_transport_config(transport_config.as_deref())
+            .with_context(|| format!("failed to load exporter transport config for {domain}"))?;
         let node_url = node_url
             .unwrap_or_else(|| format!("ws://127.0.0.1:{}", loaded.config.network.rpc_port));
+        let relay_url = relay_url
+            .unwrap_or_else(|| format!("http://{}", loaded_transport.config.relay.listen_addr));
         let store_dir =
             store_dir.unwrap_or_else(|| PathBuf::from("var/exporter").join(domain.as_str()));
 
         Ok(Self {
             domain,
             node_url,
+            relay_url,
             store_dir,
         })
     }
+}
+
+fn unix_now_millis() -> anyhow::Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is set before unix epoch")?
+        .as_millis()
+        .try_into()
+        .context("unix timestamp does not fit into u64")
 }
 
 #[cfg(test)]

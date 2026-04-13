@@ -1,6 +1,6 @@
 [package]
-name = "ialp-summary-exporter"
-description = "Phase 2A exporter for GRANDPA-certified, storage-proven IALP epoch summary packages."
+name = "ialp-summary-relay"
+description = "Phase 3A relay for durable, blackout-aware delivery of certified IALP summary packages."
 version = "0.1.0"
 license.workspace = true
 authors.workspace = true
@@ -14,20 +14,18 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-blake2.workspace = true
+axum.workspace = true
+chrono.workspace = true
 clap.workspace = true
 codec.workspace = true
 futures.workspace = true
 hex.workspace = true
 ialp-common-config.workspace = true
 ialp-common-types = { workspace = true, features = ["serde"] }
-jsonrpsee.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["std"] }
-sp-io.workspace = true
 tokio.workspace = true
-twox-hash.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

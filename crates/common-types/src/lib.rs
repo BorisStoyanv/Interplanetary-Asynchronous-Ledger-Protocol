@@ -2,7 +2,7 @@
 
 extern crate alloc;
 
-use alloc::{vec, vec::Vec};
+use alloc::{string::String, vec, vec::Vec};
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use core::{cmp::Ordering, fmt, str::FromStr};
 use scale_info::TypeInfo;
@@ -35,6 +35,7 @@ pub const SUMMARY_HEADERS_PROOF_INDEX: usize = 0;
 pub const EXPORT_PROOF_START_INDEX: usize = 1;
 pub const EXPORT_MERKLE_NODE_LABEL: &str = "IALP:export-merkle-node:v1";
 pub const EXPORT_MERKLE_EMPTY_LABEL: &str = "IALP:export-merkle-empty:v1";
+pub const RELAY_PACKAGE_ENVELOPE_VERSION: u16 = 1;
 
 pub type ExportId = [u8; 32];
 pub type AccountIdBytes = [u8; 32];
@@ -619,6 +620,98 @@ pub enum CertificationPendingReason {
     MissingTargetBlockHash,
     HistoricalStateUnavailable,
     StorageProofConstructionFailed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct RelayPackageEnvelopeV1 {
+    pub version: u16,
+    pub source_domain: DomainId,
+    pub target_domain: DomainId,
+    pub epoch_id: EpochId,
+    pub summary_hash: [u8; 32],
+    pub package_hash: [u8; 32],
+    pub package_bytes: Vec<u8>,
+    pub export_count: u32,
+    pub relay_submitted_at_unix_ms: u64,
+}
+
+impl RelayPackageEnvelopeV1 {
+    pub fn new(
+        source_domain: DomainId,
+        target_domain: DomainId,
+        epoch_id: EpochId,
+        summary_hash: [u8; 32],
+        package_hash: [u8; 32],
+        package_bytes: Vec<u8>,
+        export_count: u32,
+        relay_submitted_at_unix_ms: u64,
+    ) -> Self {
+        Self {
+            version: RELAY_PACKAGE_ENVELOPE_VERSION,
+            source_domain,
+            target_domain,
+            epoch_id,
+            summary_hash,
+            package_hash,
+            package_bytes,
+            export_count,
+            relay_submitted_at_unix_ms,
+        }
+    }
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    TypeInfo,
+    MaxEncodedLen,
+    Default,
+)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum ImporterPackageState {
+    #[default]
+    Received,
+    Verifying,
+    SubmissionRetrying,
+    AckedVerified,
+    AckedDuplicateLocal,
+    AckedDuplicateRemote,
+    AckedInvalid,
+}
+
+impl ImporterPackageState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::AckedVerified
+                | Self::AckedDuplicateLocal
+                | Self::AckedDuplicateRemote
+                | Self::AckedInvalid
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ImporterPackageStatusView {
+    pub source_domain: DomainId,
+    pub target_domain: DomainId,
+    pub epoch_id: EpochId,
+    pub package_hash: [u8; 32],
+    pub summary_hash: [u8; 32],
+    pub state: ImporterPackageState,
+    pub terminal: bool,
+    pub reason: Option<String>,
+    pub export_count: u32,
+    pub tx_hashes: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo, Default)]

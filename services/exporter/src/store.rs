@@ -11,7 +11,7 @@ use ialp_common_types::{
 };
 use serde::{Deserialize, Serialize};
 
-const INDEX_SCHEMA_VERSION: u16 = 3;
+const INDEX_SCHEMA_VERSION: u16 = 4;
 const MANIFEST_SCHEMA_VERSION: u16 = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -108,6 +108,10 @@ impl ExporterIndex {
                     record.proof_block_hash = None;
                     record.proof_count = None;
                     record.proof_kinds = Vec::new();
+                    record.relay_submission_state = RelaySubmissionState::NotSubmitted;
+                    record.relay_last_submitted_at_unix_ms = None;
+                    record.relay_submission_attempts = 0;
+                    record.relay_last_error = None;
                 }
             }
             None => {
@@ -129,6 +133,10 @@ impl ExporterIndex {
                     proof_block_hash: None,
                     proof_count: None,
                     proof_kinds: Vec::new(),
+                    relay_submission_state: RelaySubmissionState::NotSubmitted,
+                    relay_last_submitted_at_unix_ms: None,
+                    relay_submission_attempts: 0,
+                    relay_last_error: None,
                 })
             }
         }
@@ -149,6 +157,7 @@ impl ExporterIndex {
         let record = self
             .record_mut(epoch_id, target_domain)
             .expect("pending package record should exist before certification");
+        let was_certified = record.status == PackageStatus::Certified;
         record.status = PackageStatus::Certified;
         record.pending_reason = None;
         record.package_hash = Some(hex_hash(package_hash));
@@ -158,8 +167,48 @@ impl ExporterIndex {
         record.proof_block_hash = Some(hex_hash(proof_block_hash));
         record.proof_count = Some(proof_count);
         record.proof_kinds = proof_kinds;
+        if !was_certified {
+            record.relay_submission_state = RelaySubmissionState::NotSubmitted;
+            record.relay_last_submitted_at_unix_ms = None;
+            record.relay_submission_attempts = 0;
+            record.relay_last_error = None;
+        }
         self.latest_certified_epoch = Some(epoch_id);
         self.latest_certified_target_domain = Some(target_domain);
+    }
+
+    pub fn mark_relay_submitted(
+        &mut self,
+        epoch_id: EpochId,
+        target_domain: DomainId,
+        submitted_at_unix_ms: u64,
+    ) {
+        if let Some(record) = self.record_mut(epoch_id, target_domain) {
+            record.relay_submission_state = RelaySubmissionState::Submitted;
+            record.relay_last_submitted_at_unix_ms = Some(submitted_at_unix_ms);
+            record.relay_submission_attempts = record.relay_submission_attempts.saturating_add(1);
+            record.relay_last_error = None;
+        }
+    }
+
+    pub fn mark_relay_submission_error(
+        &mut self,
+        epoch_id: EpochId,
+        target_domain: DomainId,
+        submitted_at_unix_ms: u64,
+        retryable: bool,
+        error: String,
+    ) {
+        if let Some(record) = self.record_mut(epoch_id, target_domain) {
+            record.relay_submission_state = if retryable {
+                RelaySubmissionState::SubmissionRetrying
+            } else {
+                RelaySubmissionState::SubmissionFailed
+            };
+            record.relay_last_submitted_at_unix_ms = Some(submitted_at_unix_ms);
+            record.relay_submission_attempts = record.relay_submission_attempts.saturating_add(1);
+            record.relay_last_error = Some(error);
+        }
     }
 }
 
@@ -168,6 +217,15 @@ impl ExporterIndex {
 pub enum PackageStatus {
     Staged,
     Certified,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RelaySubmissionState {
+    NotSubmitted,
+    Submitted,
+    SubmissionRetrying,
+    SubmissionFailed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -188,6 +246,10 @@ pub struct PackageRecord {
     pub proof_block_hash: Option<String>,
     pub proof_count: Option<usize>,
     pub proof_kinds: Vec<String>,
+    pub relay_submission_state: RelaySubmissionState,
+    pub relay_last_submitted_at_unix_ms: Option<u64>,
+    pub relay_submission_attempts: u32,
+    pub relay_last_error: Option<String>,
 }
 
 impl PackageRecord {
@@ -207,6 +269,10 @@ impl PackageRecord {
             "proof_block_hash": self.proof_block_hash,
             "proof_count": self.proof_count,
             "proof_kinds": self.proof_kinds,
+            "relay_submission_state": self.relay_submission_state,
+            "relay_last_submitted_at_unix_ms": self.relay_last_submitted_at_unix_ms,
+            "relay_submission_attempts": self.relay_submission_attempts,
+            "relay_last_error": self.relay_last_error,
         })
     }
 }
@@ -236,6 +302,36 @@ pub struct PackageManifest {
     pub summary_storage_header_len: usize,
     pub artifacts_state: String,
     pub scale_path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ExporterIndexV3 {
+    pub schema_version: u16,
+    pub domain_id: DomainId,
+    pub latest_staged_epoch: Option<EpochId>,
+    pub latest_certified_epoch: Option<EpochId>,
+    pub latest_certified_target_domain: Option<DomainId>,
+    pub packages: Vec<PackageRecordV3>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PackageRecordV3 {
+    pub epoch_id: EpochId,
+    pub target_domain: DomainId,
+    pub summary_hash: String,
+    pub staged_at_block_number: u32,
+    pub staged_at_block_hash: String,
+    pub export_ids: Vec<String>,
+    pub export_count: usize,
+    pub status: PackageStatus,
+    pub pending_reason: Option<String>,
+    pub package_hash: Option<String>,
+    pub package_scale_path: Option<String>,
+    pub package_manifest_path: Option<String>,
+    pub proof_block_number: Option<u32>,
+    pub proof_block_hash: Option<String>,
+    pub proof_count: Option<usize>,
+    pub proof_kinds: Vec<String>,
 }
 
 pub struct Store {
@@ -288,9 +384,9 @@ impl Store {
             INDEX_SCHEMA_VERSION => serde_json::from_value(raw).with_context(|| {
                 format!("failed to decode exporter index {}", path.display())
             })?,
-            1 | 2 => self.migrate_legacy_index(raw, schema_version)?,
+            1..=3 => self.migrate_legacy_index(raw, schema_version)?,
             other => bail!(
-                "unsupported exporter index schema version {other}; expected 1, 2, or {INDEX_SCHEMA_VERSION}"
+                "unsupported exporter index schema version {other}; expected 1, 2, 3, or {INDEX_SCHEMA_VERSION}"
             ),
         };
 
@@ -410,17 +506,53 @@ impl Store {
             .and_then(serde_json::Value::as_u64)
             .map(|value| value as EpochId);
 
-        // Phase 2B must not silently treat schema 1/2 packages as export-proof-bearing outputs.
-        // The migration therefore preserves only coarse staged progress and drops all certified
-        // claims so the exporter rebuilds schema 3 packages from chain state.
-        let mut index = ExporterIndex::new(domain_id);
-        index.latest_staged_epoch = latest_staged_epoch;
-
         let archived_name = format!("index-schema-{legacy_schema_version}.json");
         self.atomic_write(
             &self.legacy_dir.join(archived_name),
             &serde_json::to_vec_pretty(&raw)?,
         )?;
+
+        if legacy_schema_version == 3 {
+            let legacy: ExporterIndexV3 =
+                serde_json::from_value(raw).context("failed to decode schema 3 exporter index")?;
+            let mut index = ExporterIndex::new(legacy.domain_id);
+            index.latest_staged_epoch = legacy.latest_staged_epoch;
+            index.latest_certified_epoch = legacy.latest_certified_epoch;
+            index.latest_certified_target_domain = legacy.latest_certified_target_domain;
+            index.packages = legacy
+                .packages
+                .into_iter()
+                .map(|record| PackageRecord {
+                    epoch_id: record.epoch_id,
+                    target_domain: record.target_domain,
+                    summary_hash: record.summary_hash,
+                    staged_at_block_number: record.staged_at_block_number,
+                    staged_at_block_hash: record.staged_at_block_hash,
+                    export_ids: record.export_ids,
+                    export_count: record.export_count,
+                    status: record.status,
+                    pending_reason: record.pending_reason,
+                    package_hash: record.package_hash,
+                    package_scale_path: record.package_scale_path,
+                    package_manifest_path: record.package_manifest_path,
+                    proof_block_number: record.proof_block_number,
+                    proof_block_hash: record.proof_block_hash,
+                    proof_count: record.proof_count,
+                    proof_kinds: record.proof_kinds,
+                    relay_submission_state: RelaySubmissionState::NotSubmitted,
+                    relay_last_submitted_at_unix_ms: None,
+                    relay_submission_attempts: 0,
+                    relay_last_error: None,
+                })
+                .collect();
+            return Ok(index);
+        }
+
+        // Phase 2B must not silently treat schema 1/2 packages as export-proof-bearing outputs.
+        // The migration therefore preserves only coarse staged progress and drops all certified
+        // claims so the exporter rebuilds schema 3/4 packages from chain state.
+        let mut index = ExporterIndex::new(domain_id);
+        index.latest_staged_epoch = latest_staged_epoch;
         Ok(index)
     }
 

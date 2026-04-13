@@ -1,10 +1,12 @@
 use std::{
+    collections::BTreeMap,
     fmt, fs,
     path::{Path, PathBuf},
     str::FromStr,
 };
 
 use anyhow::Context;
+use chrono::{DateTime, Utc};
 use ialp_common_types::{
     fixed_bytes, ChainIdentity, DomainId, CHAIN_ID_BYTES, CHAIN_NAME_BYTES, TOKEN_SYMBOL_BYTES,
 };
@@ -13,6 +15,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 const DEFAULT_CONFIG_ROOT: &str = "config/domains";
+const DEFAULT_TRANSPORT_CONFIG_PATH: &str = "config/transport/local.toml";
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -103,6 +106,50 @@ pub struct DomainConfig {
 pub struct LoadedDomainConfig {
     pub source: PathBuf,
     pub config: DomainConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct RelayTransportConfig {
+    pub listen_addr: String,
+    pub store_dir: PathBuf,
+    pub scheduler_tick_millis: u64,
+    pub ack_poll_millis: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ImporterTransportConfig {
+    pub listen_addr: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct BlackoutWindowConfig {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct LinkProfileConfig {
+    pub source_domain: DomainId,
+    pub target_domain: DomainId,
+    pub base_one_way_delay_seconds: u64,
+    pub initial_retry_delay_seconds: u64,
+    pub max_retry_delay_seconds: u64,
+    pub max_attempts: u32,
+    #[serde(default)]
+    pub blackout_windows: Vec<BlackoutWindowConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct TransportConfig {
+    pub relay: RelayTransportConfig,
+    pub importers: BTreeMap<DomainId, ImporterTransportConfig>,
+    pub links: Vec<LinkProfileConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedTransportConfig {
+    pub source: PathBuf,
+    pub config: TransportConfig,
 }
 
 impl DomainConfig {
@@ -253,6 +300,138 @@ impl DomainConfig {
     }
 }
 
+impl TransportConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.relay.listen_addr.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "relay.listen_addr must not be empty".into(),
+            ));
+        }
+        if self.relay.store_dir.as_os_str().is_empty() {
+            return Err(ConfigError::Validation(
+                "relay.store_dir must not be empty".into(),
+            ));
+        }
+        if self.relay.scheduler_tick_millis == 0 {
+            return Err(ConfigError::Validation(
+                "relay.scheduler_tick_millis must be greater than zero".into(),
+            ));
+        }
+        if self.relay.ack_poll_millis == 0 {
+            return Err(ConfigError::Validation(
+                "relay.ack_poll_millis must be greater than zero".into(),
+            ));
+        }
+
+        let expected_domains = [DomainId::Earth, DomainId::Moon, DomainId::Mars];
+        for domain in expected_domains {
+            let importer = self.importers.get(&domain).ok_or_else(|| {
+                ConfigError::Validation(format!(
+                    "missing importer.listen_addr for domain {}",
+                    domain.as_str()
+                ))
+            })?;
+            if importer.listen_addr.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "importer.listen_addr for domain {} must not be empty",
+                    domain.as_str()
+                )));
+            }
+        }
+
+        let mut importer_addresses = self
+            .importers
+            .values()
+            .map(|config| config.listen_addr.as_str())
+            .collect::<Vec<_>>();
+        importer_addresses.sort_unstable();
+        importer_addresses.dedup();
+        if importer_addresses.len() != self.importers.len() {
+            return Err(ConfigError::Validation(
+                "importer.listen_addr values must be unique".into(),
+            ));
+        }
+
+        if self.links.len() != 6 {
+            return Err(ConfigError::Validation(
+                "transport config must declare exactly 6 directed links".into(),
+            ));
+        }
+
+        let mut seen_links = BTreeMap::<(DomainId, DomainId), ()>::new();
+        for link in &self.links {
+            if link.source_domain == link.target_domain {
+                return Err(ConfigError::Validation(format!(
+                    "link {} -> {} must not target the same domain",
+                    link.source_domain, link.target_domain
+                )));
+            }
+            if link.base_one_way_delay_seconds == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "link {} -> {} base_one_way_delay_seconds must be greater than zero",
+                    link.source_domain, link.target_domain
+                )));
+            }
+            if link.initial_retry_delay_seconds == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "link {} -> {} initial_retry_delay_seconds must be greater than zero",
+                    link.source_domain, link.target_domain
+                )));
+            }
+            if link.max_retry_delay_seconds < link.initial_retry_delay_seconds {
+                return Err(ConfigError::Validation(format!(
+                    "link {} -> {} max_retry_delay_seconds must be >= initial_retry_delay_seconds",
+                    link.source_domain, link.target_domain
+                )));
+            }
+            for window in &link.blackout_windows {
+                if window.start >= window.end {
+                    return Err(ConfigError::Validation(format!(
+                        "link {} -> {} blackout window start must be before end",
+                        link.source_domain, link.target_domain
+                    )));
+                }
+            }
+
+            if seen_links
+                .insert((link.source_domain, link.target_domain), ())
+                .is_some()
+            {
+                return Err(ConfigError::Validation(format!(
+                    "duplicate directed link {} -> {}",
+                    link.source_domain, link.target_domain
+                )));
+            }
+        }
+
+        for source in expected_domains {
+            for target in expected_domains {
+                if source == target {
+                    continue;
+                }
+                if !seen_links.contains_key(&(source, target)) {
+                    return Err(ConfigError::Validation(format!(
+                        "missing directed link {} -> {}",
+                        source, target
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn link(
+        &self,
+        source_domain: DomainId,
+        target_domain: DomainId,
+    ) -> Option<&LinkProfileConfig> {
+        self.links
+            .iter()
+            .find(|link| link.source_domain == source_domain && link.target_domain == target_domain)
+    }
+}
+
 pub fn load_domain_config(
     domain: DomainId,
     path_override: Option<&Path>,
@@ -286,8 +465,34 @@ pub fn build_chain_identity(config: &DomainConfig) -> ChainIdentity {
     }
 }
 
+pub fn load_transport_config(
+    path_override: Option<&Path>,
+) -> Result<LoadedTransportConfig, ConfigError> {
+    let path = path_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_transport_config_path);
+    let contents = fs::read_to_string(&path).map_err(|source| ConfigError::ReadFailed {
+        path: path.clone(),
+        source,
+    })?;
+    let config: TransportConfig =
+        toml::from_str(&contents).map_err(|source| ConfigError::ParseFailed {
+            path: path.clone(),
+            source,
+        })?;
+    config.validate()?;
+    Ok(LoadedTransportConfig {
+        source: path,
+        config,
+    })
+}
+
 pub fn default_config_path(domain: DomainId) -> PathBuf {
     PathBuf::from(DEFAULT_CONFIG_ROOT).join(format!("{domain}.toml"))
+}
+
+pub fn default_transport_config_path() -> PathBuf {
+    PathBuf::from(DEFAULT_TRANSPORT_CONFIG_PATH)
 }
 
 pub fn load_workspace_domain_config(domain: DomainId) -> anyhow::Result<LoadedDomainConfig> {
@@ -299,6 +504,12 @@ pub fn load_workspace_domain_config(domain: DomainId) -> anyhow::Result<LoadedDo
                 domain.as_str()
             )
         })
+}
+
+pub fn load_workspace_transport_config() -> anyhow::Result<LoadedTransportConfig> {
+    load_transport_config(None)
+        .map_err(anyhow::Error::from)
+        .with_context(|| "failed to load workspace transport config")
 }
 
 #[cfg(test)]
@@ -341,5 +552,172 @@ mod tests {
                 load_domain_config(domain, Some(&config_path)).expect("workspace config loads");
             assert_eq!(loaded.config.domain_id, domain);
         }
+    }
+
+    #[test]
+    fn loads_workspace_transport_config() {
+        let config_path = workspace_root().join(default_transport_config_path());
+        let loaded = load_transport_config(Some(&config_path)).expect("transport config loads");
+
+        assert_eq!(loaded.config.links.len(), 6);
+        assert_eq!(
+            loaded
+                .config
+                .importers
+                .get(&DomainId::Mars)
+                .expect("mars importer")
+                .listen_addr,
+            "127.0.0.1:9953"
+        );
+        assert!(loaded
+            .config
+            .link(DomainId::Earth, DomainId::Moon)
+            .is_some());
+    }
+
+    #[test]
+    fn rejects_missing_directed_link() {
+        let config: TransportConfig = toml::from_str(
+            r#"
+                [relay]
+                listen_addr = "127.0.0.1:9950"
+                store_dir = "var/relay"
+                scheduler_tick_millis = 500
+                ack_poll_millis = 500
+
+                [importers.earth]
+                listen_addr = "127.0.0.1:9951"
+
+                [importers.moon]
+                listen_addr = "127.0.0.1:9952"
+
+                [importers.mars]
+                listen_addr = "127.0.0.1:9953"
+
+                [[links]]
+                source_domain = "earth"
+                target_domain = "moon"
+                base_one_way_delay_seconds = 1
+                initial_retry_delay_seconds = 1
+                max_retry_delay_seconds = 1
+                max_attempts = 0
+
+                [[links]]
+                source_domain = "earth"
+                target_domain = "mars"
+                base_one_way_delay_seconds = 1
+                initial_retry_delay_seconds = 1
+                max_retry_delay_seconds = 1
+                max_attempts = 0
+
+                [[links]]
+                source_domain = "moon"
+                target_domain = "earth"
+                base_one_way_delay_seconds = 1
+                initial_retry_delay_seconds = 1
+                max_retry_delay_seconds = 1
+                max_attempts = 0
+
+                [[links]]
+                source_domain = "moon"
+                target_domain = "mars"
+                base_one_way_delay_seconds = 1
+                initial_retry_delay_seconds = 1
+                max_retry_delay_seconds = 1
+                max_attempts = 0
+
+                [[links]]
+                source_domain = "mars"
+                target_domain = "earth"
+                base_one_way_delay_seconds = 1
+                initial_retry_delay_seconds = 1
+                max_retry_delay_seconds = 1
+                max_attempts = 0
+            "#,
+        )
+        .expect("toml parses");
+
+        let error = config.validate().expect_err("validation should fail");
+        assert!(error.to_string().contains("exactly 6 directed links"));
+    }
+
+    #[test]
+    fn rejects_invalid_blackout_window() {
+        let config: TransportConfig = toml::from_str(
+            r#"
+                [relay]
+                listen_addr = "127.0.0.1:9950"
+                store_dir = "var/relay"
+                scheduler_tick_millis = 500
+                ack_poll_millis = 500
+
+                [importers.earth]
+                listen_addr = "127.0.0.1:9951"
+
+                [importers.moon]
+                listen_addr = "127.0.0.1:9952"
+
+                [importers.mars]
+                listen_addr = "127.0.0.1:9953"
+
+                [[links]]
+                source_domain = "earth"
+                target_domain = "moon"
+                base_one_way_delay_seconds = 1
+                initial_retry_delay_seconds = 1
+                max_retry_delay_seconds = 1
+                max_attempts = 0
+
+                [[links.blackout_windows]]
+                start = "2026-01-01T01:00:00Z"
+                end = "2026-01-01T00:00:00Z"
+
+                [[links]]
+                source_domain = "earth"
+                target_domain = "mars"
+                base_one_way_delay_seconds = 1
+                initial_retry_delay_seconds = 1
+                max_retry_delay_seconds = 1
+                max_attempts = 0
+
+                [[links]]
+                source_domain = "moon"
+                target_domain = "earth"
+                base_one_way_delay_seconds = 1
+                initial_retry_delay_seconds = 1
+                max_retry_delay_seconds = 1
+                max_attempts = 0
+
+                [[links]]
+                source_domain = "moon"
+                target_domain = "mars"
+                base_one_way_delay_seconds = 1
+                initial_retry_delay_seconds = 1
+                max_retry_delay_seconds = 1
+                max_attempts = 0
+
+                [[links]]
+                source_domain = "mars"
+                target_domain = "earth"
+                base_one_way_delay_seconds = 1
+                initial_retry_delay_seconds = 1
+                max_retry_delay_seconds = 1
+                max_attempts = 0
+
+                [[links]]
+                source_domain = "mars"
+                target_domain = "moon"
+                base_one_way_delay_seconds = 1
+                initial_retry_delay_seconds = 1
+                max_retry_delay_seconds = 1
+                max_attempts = 0
+            "#,
+        )
+        .expect("toml parses");
+
+        let error = config.validate().expect_err("validation should fail");
+        assert!(error
+            .to_string()
+            .contains("blackout window start must be before end"));
     }
 }

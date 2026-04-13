@@ -13,12 +13,30 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// Run the importer HTTP server and background verification loop.
+    Run(RunArgs),
     /// Verify a proof-bearing package and submit minimal observed-import records.
     Verify(VerifyArgs),
     /// Inspect importer-local verification and duplicate status.
     Status(StatusArgs),
     /// Show one importer-local record.
     Show(ShowArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RunArgs {
+    #[arg(long)]
+    pub domain: DomainId,
+    #[arg(long)]
+    pub node_url: Option<String>,
+    #[arg(long)]
+    pub submitter_suri: String,
+    #[arg(long)]
+    pub transport_config: Option<PathBuf>,
+    #[arg(long)]
+    pub store_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    pub json_logs: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -31,6 +49,8 @@ pub struct VerifyArgs {
     pub node_url: Option<String>,
     #[arg(long)]
     pub submitter_suri: String,
+    #[arg(long)]
+    pub transport_config: Option<PathBuf>,
     #[arg(long)]
     pub store_dir: Option<PathBuf>,
     #[arg(long)]

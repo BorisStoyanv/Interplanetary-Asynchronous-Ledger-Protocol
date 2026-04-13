@@ -2,15 +2,28 @@ mod cli;
 mod rpc_client;
 mod store;
 
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{anyhow, bail, Context};
+use axum::{
+    body::Bytes,
+    extract::{Path as AxumPath, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use clap::Parser;
 use codec::{Decode, Encode};
-use ialp_common_config::load_domain_config;
+use ialp_common_config::{load_domain_config, load_transport_config};
 use ialp_common_types::{
-    summary_header_storage_key, CertifiedSummaryPackage, DomainId, InclusionProof,
-    ObservedImportClaim, SummaryCertificate,
+    summary_header_storage_key, CertifiedSummaryPackage, DomainId, ImporterPackageState,
+    ImporterPackageStatusView, InclusionProof, ObservedImportClaim, RelayPackageEnvelopeV1,
+    SummaryCertificate,
 };
 use pallet_ialp_transfers::Call as TransfersCall;
 use sc_consensus_grandpa::GrandpaJustification;
@@ -22,63 +35,497 @@ use sp_runtime::{
     MultiAddress, MultiSignature,
 };
 use sp_state_machine::{read_proof_check, StorageProof};
+use tokio::{net::TcpListener, sync::Mutex, time::sleep};
 
 use crate::{
     cli::{parse_export_id_hex, Cli, Commands},
     rpc_client::{load_submitter_pair, NodeRpcClient},
-    store::{DuplicateStatus, ImportRecord, Store, SubmissionStatus, VerificationStatus},
+    store::{
+        decode_hex_hash, DuplicateStatus, ImportRecord, ImporterIndex, PackageRecord, Store,
+        SubmissionStatus, VerificationStatus,
+    },
 };
+
+const PROCESSOR_TICK_MILLIS: u64 = 500;
+
+#[derive(Clone)]
+struct ImporterSettings {
+    domain: DomainId,
+    node_url: String,
+    listen_addr: Option<String>,
+    store: Arc<Store>,
+    submitter_suri: Option<String>,
+}
+
+#[derive(Clone)]
+struct AppState {
+    settings: ImporterSettings,
+    index: Arc<Mutex<ImporterIndex>>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ImporterIngestReceipt {
+    accepted: bool,
+    idempotent: bool,
+    status: ImporterPackageStatusView,
+}
 
 pub async fn run_cli() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Run(args) => run_importer(args).await,
         Commands::Verify(args) => verify_package_command(args).await,
         Commands::Status(args) => show_status(args),
         Commands::Show(args) => show_record(args),
     }
 }
 
+async fn run_importer(args: cli::RunArgs) -> anyhow::Result<()> {
+    let settings = ImporterSettings::load(
+        args.domain,
+        args.node_url,
+        args.store_dir,
+        args.transport_config,
+        Some(args.submitter_suri),
+    )?;
+    let index = settings.store.load_index()?;
+    let app_state = Arc::new(AppState {
+        settings: settings.clone(),
+        index: Arc::new(Mutex::new(index)),
+    });
+
+    let processor_state = app_state.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = process_pending_packages_once(&processor_state).await {
+                eprintln!("importer processing loop failed: {error:#}");
+            }
+            sleep(Duration::from_millis(PROCESSOR_TICK_MILLIS)).await;
+        }
+    });
+
+    let listen_addr = settings
+        .listen_addr
+        .clone()
+        .ok_or_else(|| anyhow!("importer run mode requires a transport config with listen_addr"))?;
+    let router = Router::new()
+        .route("/api/v1/packages", post(receive_package))
+        .route(
+            "/api/v1/packages/{source_domain}/{target_domain}/{epoch_id}/{package_hash}",
+            get(package_status),
+        )
+        .with_state(app_state);
+    let listener = TcpListener::bind(&listen_addr)
+        .await
+        .with_context(|| format!("failed to bind importer listener {}", listen_addr))?;
+    axum::serve(listener, router)
+        .await
+        .context("importer HTTP server exited unexpectedly")
+}
+
 async fn verify_package_command(args: cli::VerifyArgs) -> anyhow::Result<()> {
-    let settings = ImporterSettings::load(args.domain, args.node_url, args.store_dir.clone())?;
-    let rpc = NodeRpcClient::connect(&settings.node_url).await?;
-    let mut index = settings.store.load_index()?;
+    let settings = ImporterSettings::load(
+        args.domain,
+        args.node_url,
+        args.store_dir,
+        args.transport_config,
+        Some(args.submitter_suri),
+    )?;
     let package_bytes = std::fs::read(&args.package)
         .with_context(|| format!("failed to read package {}", args.package.display()))?;
     let package = CertifiedSummaryPackage::decode(&mut &package_bytes[..])
         .map_err(|error| anyhow!("failed to decode certified summary package: {error}"))?;
-
     verify_package_hash(&package)?;
-    let certificate = verify_summary_chain_context(&package)?;
-    verify_grandpa_certificate(&certificate, package.header.domain_id)?;
-    let export_proofs = verify_export_proofs(&package, args.domain)?;
+    let package_view = inspect_package_for_ingest(&package, settings.domain)?;
+    let now = unix_now_millis()?;
+    let mut index = settings.store.load_index()?;
+    let (record, _) = ensure_package_record(
+        &settings.store,
+        &mut index,
+        package_view.source_domain,
+        package_view.target_domain,
+        package_view.epoch_id,
+        package.header.summary_hash,
+        package.package_hash,
+        package_view.export_count,
+        now,
+        &package_bytes,
+    )?;
+    settings.store.save_index(&index)?;
+    process_package_by_identity(
+        &settings,
+        record.source_domain,
+        record.target_domain,
+        record.epoch_id,
+        decode_hex_hash(&record.package_hash)?,
+    )
+    .await?;
 
-    let submitter_pair = load_submitter_pair(&args.submitter_suri)?;
-    let submitter_account = submitter_account_id(&submitter_pair);
-    let configured_importer = rpc
-        .importer_account()
-        .await?
-        .ok_or_else(|| anyhow!("destination chain is missing configured importer account"))?;
-    if submitter_account != configured_importer {
-        bail!(
-            "submitter account {} does not match allowlisted importer account {}",
-            submitter_account.to_ss58check(),
-            configured_importer.to_ss58check()
-        );
+    let refreshed_index = settings.store.load_index()?;
+    let package_record = refreshed_index
+        .package(
+            package_view.source_domain,
+            package_view.target_domain,
+            package_view.epoch_id,
+            package.package_hash,
+        )
+        .cloned()
+        .ok_or_else(|| anyhow!("package record missing after verification"))?;
+
+    let output = serde_json::json!({
+        "domain": args.domain,
+        "package": args.package,
+        "status": package_status_view(&package_record),
+        "imports": refreshed_index.imports.iter().map(ImportRecord::json_summary).collect::<Vec<_>>(),
+    });
+    render_json(output, args.json);
+    Ok(())
+}
+
+fn show_status(args: cli::StatusArgs) -> anyhow::Result<()> {
+    let settings = ImporterSettings::load(args.domain, None, args.store_dir, None, None)?;
+    let index = settings.store.load_index()?;
+
+    let output = if let Some(export_id) = args.export_id {
+        let export_id = parse_export_id_hex(&export_id)?;
+        serde_json::json!({
+            "domain": args.domain,
+            "record": index.record(export_id).map(ImportRecord::json_summary),
+        })
+    } else {
+        serde_json::json!({
+            "domain": args.domain,
+            "index": index.json_summary(),
+            "packages": index.packages.iter().map(PackageRecord::json_summary).collect::<Vec<_>>(),
+            "records": index.imports.iter().map(ImportRecord::json_summary).collect::<Vec<_>>(),
+        })
+    };
+    render_json(output, args.json);
+    Ok(())
+}
+
+fn show_record(args: cli::ShowArgs) -> anyhow::Result<()> {
+    let settings = ImporterSettings::load(args.domain, None, args.store_dir, None, None)?;
+    let export_id = parse_export_id_hex(&args.export_id)?;
+    let record = settings
+        .store
+        .load_record(export_id)?
+        .ok_or_else(|| anyhow!("no importer record found for export_id {}", args.export_id))?;
+    render_json(record.json_summary(), args.json);
+    Ok(())
+}
+
+async fn receive_package(State(app): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
+    let response = async {
+        let envelope = RelayPackageEnvelopeV1::decode(&mut &body[..])
+            .map_err(|error| anyhow!("failed to decode relay package envelope: {error}"))?;
+        let package = CertifiedSummaryPackage::decode(&mut &envelope.package_bytes[..])
+            .map_err(|error| anyhow!("failed to decode certified summary package: {error}"))?;
+        verify_package_hash(&package)?;
+        let package_view = inspect_package_for_ingest(&package, app.settings.domain)?;
+        if envelope.source_domain != package_view.source_domain
+            || envelope.target_domain != package_view.target_domain
+            || envelope.epoch_id != package_view.epoch_id
+            || envelope.summary_hash != package.header.summary_hash
+            || envelope.package_hash != package.package_hash
+            || envelope.export_count != package_view.export_count
+        {
+            bail!("relay envelope metadata does not match certified package contents");
+        }
+
+        let now = unix_now_millis()?;
+        let mut index = app.index.lock().await;
+        let (record, _idempotent) = ensure_package_record(
+            &app.settings.store,
+            &mut index,
+            package_view.source_domain,
+            package_view.target_domain,
+            package_view.epoch_id,
+            package.header.summary_hash,
+            package.package_hash,
+            package_view.export_count,
+            now,
+            &envelope.package_bytes,
+        )?;
+        app.settings.store.save_index(&index)?;
+        let idempotent = record.received_at_unix_ms != now;
+        let status = if idempotent {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        };
+        Ok::<_, anyhow::Error>((
+            status,
+            Json(ImporterIngestReceipt {
+                accepted: true,
+                idempotent,
+                status: package_status_view(&record),
+            }),
+        ))
+    }
+    .await;
+
+    match response {
+        Ok(success) => success.into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
+async fn package_status(
+    State(app): State<Arc<AppState>>,
+    AxumPath((source_domain, target_domain, epoch_id, package_hash)): AxumPath<(
+        DomainId,
+        DomainId,
+        u64,
+        String,
+    )>,
+) -> impl IntoResponse {
+    let response = async {
+        let package_hash = decode_hex_hash(&package_hash)?;
+        let index = app.index.lock().await;
+        let record = index
+            .package(source_domain, target_domain, epoch_id, package_hash)
+            .ok_or_else(|| anyhow!("importer package not found"))?;
+        Ok::<_, anyhow::Error>(Json(package_status_view(record)))
+    }
+    .await;
+
+    match response {
+        Ok(success) => (StatusCode::OK, success).into_response(),
+        Err(error) if error.to_string().contains("not found") => {
+            (StatusCode::NOT_FOUND, error.to_string()).into_response()
+        }
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
+async fn process_pending_packages_once(app: &Arc<AppState>) -> anyhow::Result<()> {
+    let work = {
+        let index = app.index.lock().await;
+        index
+            .packages
+            .iter()
+            .filter(|record| !record.state.is_terminal())
+            .map(|record| {
+                (
+                    record.source_domain,
+                    record.target_domain,
+                    record.epoch_id,
+                    record.package_hash.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for (source_domain, target_domain, epoch_id, package_hash) in work {
+        process_package_by_identity(
+            &app.settings,
+            source_domain,
+            target_domain,
+            epoch_id,
+            decode_hex_hash(&package_hash)?,
+        )
+        .await?;
+        let refreshed = app.settings.store.load_index()?;
+        let mut index = app.index.lock().await;
+        *index = refreshed;
     }
 
-    let runtime_version = rpc.runtime_version().await?;
-    ensure_runtime_version_matches(&runtime_version)?;
-    let genesis_hash = rpc.genesis_hash().await?;
+    Ok(())
+}
 
-    let mut results = Vec::new();
+async fn process_package_by_identity(
+    settings: &ImporterSettings,
+    source_domain: DomainId,
+    target_domain: DomainId,
+    epoch_id: u64,
+    package_hash: [u8; 32],
+) -> anyhow::Result<()> {
+    let mut index = settings.store.load_index()?;
+    let mut package_record = index
+        .package(source_domain, target_domain, epoch_id, package_hash)
+        .cloned()
+        .ok_or_else(|| anyhow!("importer package record not found"))?;
+
+    if package_record.state.is_terminal() {
+        return Ok(());
+    }
+
+    package_record.state = ImporterPackageState::Verifying;
+    package_record.last_updated_at_unix_ms = unix_now_millis()?;
+    package_record.reason = None;
+    settings
+        .store
+        .persist_package(&mut index, package_record.clone(), None)?;
+    settings.store.save_index(&index)?;
+
+    let payload = settings.store.load_package_bytes(&package_record)?;
+    let package = match CertifiedSummaryPackage::decode(&mut &payload[..]) {
+        Ok(package) => package,
+        Err(error) => {
+            finalize_package_error(
+                settings,
+                package_record,
+                ImporterPackageState::AckedInvalid,
+                format!("failed to decode stored package bytes: {error}"),
+            )?;
+            return Ok(());
+        }
+    };
+
+    if let Err(error) = verify_package_hash(&package) {
+        finalize_package_error(
+            settings,
+            package_record,
+            ImporterPackageState::AckedInvalid,
+            error.to_string(),
+        )?;
+        return Ok(());
+    }
+
+    let certificate = match verify_summary_chain_context(&package) {
+        Ok(certificate) => certificate,
+        Err(error) => {
+            finalize_package_error(
+                settings,
+                package_record,
+                ImporterPackageState::AckedInvalid,
+                error.to_string(),
+            )?;
+            return Ok(());
+        }
+    };
+    if let Err(error) = verify_grandpa_certificate(&certificate, package.header.domain_id) {
+        finalize_package_error(
+            settings,
+            package_record,
+            ImporterPackageState::AckedInvalid,
+            error.to_string(),
+        )?;
+        return Ok(());
+    }
+    let export_proofs = match verify_export_proofs(&package, settings.domain) {
+        Ok(export_proofs) => export_proofs,
+        Err(error) => {
+            finalize_package_error(
+                settings,
+                package_record,
+                ImporterPackageState::AckedInvalid,
+                error.to_string(),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let rpc = match NodeRpcClient::connect(&settings.node_url).await {
+        Ok(rpc) => rpc,
+        Err(error) => {
+            finalize_package_error(
+                settings,
+                package_record,
+                ImporterPackageState::SubmissionRetrying,
+                error.to_string(),
+            )?;
+            return Ok(());
+        }
+    };
+    let Some(submitter_suri) = settings.submitter_suri.as_deref() else {
+        finalize_package_error(
+            settings,
+            package_record,
+            ImporterPackageState::AckedInvalid,
+            "submitter_suri is required for importer processing".into(),
+        )?;
+        return Ok(());
+    };
+    let submitter_pair = match load_submitter_pair(submitter_suri) {
+        Ok(pair) => pair,
+        Err(error) => {
+            finalize_package_error(
+                settings,
+                package_record,
+                ImporterPackageState::AckedInvalid,
+                error.to_string(),
+            )?;
+            return Ok(());
+        }
+    };
+    let submitter_account = submitter_account_id(&submitter_pair);
+    let configured_importer = match rpc.importer_account().await? {
+        Some(account) => account,
+        None => {
+            finalize_package_error(
+                settings,
+                package_record,
+                ImporterPackageState::SubmissionRetrying,
+                "destination chain is missing configured importer account".into(),
+            )?;
+            return Ok(());
+        }
+    };
+    if submitter_account != configured_importer {
+        finalize_package_error(
+            settings,
+            package_record,
+            ImporterPackageState::AckedInvalid,
+            format!(
+                "submitter account {} does not match allowlisted importer account {}",
+                submitter_account.to_ss58check(),
+                configured_importer.to_ss58check()
+            ),
+        )?;
+        return Ok(());
+    }
+
+    let runtime_version = match rpc.runtime_version().await {
+        Ok(runtime_version) => runtime_version,
+        Err(error) => {
+            finalize_package_error(
+                settings,
+                package_record,
+                ImporterPackageState::SubmissionRetrying,
+                error.to_string(),
+            )?;
+            return Ok(());
+        }
+    };
+    if let Err(error) = ensure_runtime_version_matches(&runtime_version) {
+        finalize_package_error(
+            settings,
+            package_record,
+            ImporterPackageState::AckedInvalid,
+            error.to_string(),
+        )?;
+        return Ok(());
+    }
+    let genesis_hash = match rpc.genesis_hash().await {
+        Ok(hash) => hash,
+        Err(error) => {
+            finalize_package_error(
+                settings,
+                package_record,
+                ImporterPackageState::SubmissionRetrying,
+                error.to_string(),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let mut index = settings.store.load_index()?;
+    let mut tx_hashes = Vec::new();
+    let mut duplicate_local = 0usize;
+    let mut duplicate_remote = 0usize;
+    let mut observed_new = 0usize;
+
     for proof in export_proofs {
         let export_id = proof.leaf.export_id;
-        if let Some(existing) = index.record(export_id).cloned() {
-            results.push(existing);
+        if index.record(export_id).is_some() {
+            duplicate_local = duplicate_local.saturating_add(1);
             continue;
         }
         if rpc.observed_import(export_id).await?.is_some() {
+            duplicate_remote = duplicate_remote.saturating_add(1);
             let record = build_duplicate_record(
                 &package,
                 &proof,
@@ -86,8 +533,7 @@ async fn verify_package_command(args: cli::VerifyArgs) -> anyhow::Result<()> {
                 SubmissionStatus::SkippedDuplicate,
                 Some("export_id already observed on destination chain".into()),
             );
-            settings.store.persist_record(&mut index, record.clone())?;
-            results.push(record);
+            settings.store.persist_record(&mut index, record)?;
             continue;
         }
 
@@ -102,16 +548,52 @@ async fn verify_package_command(args: cli::VerifyArgs) -> anyhow::Result<()> {
             recipient: proof.leaf.recipient,
             amount: proof.leaf.amount,
         };
-        let extrinsic = build_observed_import_extrinsic(
+        let nonce = match rpc.account_next_index(&submitter_account).await {
+            Ok(nonce) => nonce,
+            Err(error) => {
+                settings.store.save_index(&index)?;
+                finalize_package_error(
+                    settings,
+                    package_record,
+                    ImporterPackageState::SubmissionRetrying,
+                    error.to_string(),
+                )?;
+                return Ok(());
+            }
+        };
+        let extrinsic = match build_observed_import_extrinsic(
             &submitter_pair,
             submitter_account.clone(),
             runtime_version.spec_version,
             runtime_version.transaction_version,
             genesis_hash,
-            rpc.account_next_index(&submitter_account).await?,
+            nonce,
             claim.clone(),
-        )?;
-        let tx_hash = rpc.submit_extrinsic(extrinsic).await?;
+        ) {
+            Ok(extrinsic) => extrinsic,
+            Err(error) => {
+                finalize_package_error(
+                    settings,
+                    package_record,
+                    ImporterPackageState::AckedInvalid,
+                    error.to_string(),
+                )?;
+                return Ok(());
+            }
+        };
+        let tx_hash = match rpc.submit_extrinsic(extrinsic).await {
+            Ok(tx_hash) => tx_hash,
+            Err(error) => {
+                settings.store.save_index(&index)?;
+                finalize_package_error(
+                    settings,
+                    package_record,
+                    ImporterPackageState::SubmissionRetrying,
+                    error.to_string(),
+                )?;
+                return Ok(());
+            }
+        };
 
         let record = ImportRecord {
             export_id: hex_hash(export_id),
@@ -122,59 +604,168 @@ async fn verify_package_command(args: cli::VerifyArgs) -> anyhow::Result<()> {
             verification_status: VerificationStatus::Verified,
             duplicate_status: DuplicateStatus::NotDuplicate,
             submission_status: SubmissionStatus::RemoteObserved,
-            tx_hash: Some(tx_hash),
+            tx_hash: Some(tx_hash.clone()),
             reason: Some("remote_observed recorded".into()),
         };
-        settings.store.persist_record(&mut index, record.clone())?;
-        results.push(record);
+        settings.store.persist_record(&mut index, record)?;
+        tx_hashes.push(tx_hash);
+        observed_new = observed_new.saturating_add(1);
     }
 
-    settings.store.save_index(&index)?;
-    render_json(
-        serde_json::json!({
-            "domain": args.domain,
-            "package": args.package,
-            "source_domain": package.header.domain_id,
-            "source_epoch_id": package.header.epoch_id,
-            "summary_hash": hex_hash(package.header.summary_hash),
-            "package_hash": hex_hash(package.package_hash),
-            "results": results.iter().map(ImportRecord::json_summary).collect::<Vec<_>>(),
-        }),
-        args.json,
-    );
-    Ok(())
-}
-
-fn show_status(args: cli::StatusArgs) -> anyhow::Result<()> {
-    let settings = ImporterSettings::load(args.domain, None, args.store_dir)?;
-    let index = settings.store.load_index()?;
-
-    let output = if let Some(export_id) = args.export_id {
-        let export_id = parse_export_id_hex(&export_id)?;
-        serde_json::json!({
-            "domain": args.domain,
-            "record": index.record(export_id).map(ImportRecord::json_summary),
-        })
+    let final_state = if observed_new > 0 {
+        ImporterPackageState::AckedVerified
+    } else if duplicate_local > 0 && duplicate_remote == 0 {
+        ImporterPackageState::AckedDuplicateLocal
+    } else if duplicate_remote > 0 && duplicate_local == 0 {
+        ImporterPackageState::AckedDuplicateRemote
     } else {
-        serde_json::json!({
-            "domain": args.domain,
-            "index": index.json_summary(),
-            "records": index.imports.iter().map(ImportRecord::json_summary).collect::<Vec<_>>(),
-        })
+        ImporterPackageState::AckedVerified
     };
-    render_json(output, args.json);
+
+    let mut refreshed_package = settings
+        .store
+        .load_package(source_domain, target_domain, epoch_id, package_hash)?
+        .ok_or_else(|| anyhow!("package disappeared during processing"))?;
+    refreshed_package.state = final_state;
+    refreshed_package.tx_hashes = tx_hashes;
+    refreshed_package.completed_at_unix_ms = Some(unix_now_millis()?);
+    refreshed_package.last_updated_at_unix_ms = refreshed_package.completed_at_unix_ms.unwrap();
+    refreshed_package.reason = Some(match final_state {
+        ImporterPackageState::AckedVerified => {
+            "package verified and remote_observed recorded or already known".into()
+        }
+        ImporterPackageState::AckedDuplicateLocal => "all exports already processed locally".into(),
+        ImporterPackageState::AckedDuplicateRemote => {
+            "all exports already observed on destination chain".into()
+        }
+        _ => "package processing completed".into(),
+    });
+    settings
+        .store
+        .persist_package(&mut index, refreshed_package, None)?;
+    settings.store.save_index(&index)?;
     Ok(())
 }
 
-fn show_record(args: cli::ShowArgs) -> anyhow::Result<()> {
-    let settings = ImporterSettings::load(args.domain, None, args.store_dir)?;
-    let export_id = parse_export_id_hex(&args.export_id)?;
-    let record = settings
-        .store
-        .load_record(export_id)?
-        .ok_or_else(|| anyhow!("no importer record found for export_id {}", args.export_id))?;
-    render_json(record.json_summary(), args.json);
-    Ok(())
+fn ensure_package_record(
+    store: &Store,
+    index: &mut ImporterIndex,
+    source_domain: DomainId,
+    target_domain: DomainId,
+    epoch_id: u64,
+    summary_hash: [u8; 32],
+    package_hash: [u8; 32],
+    export_count: u32,
+    now: u64,
+    payload_bytes: &[u8],
+) -> anyhow::Result<(PackageRecord, bool)> {
+    if let Some(existing) = index
+        .package(source_domain, target_domain, epoch_id, package_hash)
+        .cloned()
+    {
+        store.persist_package(index, existing.clone(), Some(payload_bytes))?;
+        return Ok((existing, true));
+    }
+
+    let record = store.build_package_record(
+        source_domain,
+        target_domain,
+        epoch_id,
+        summary_hash,
+        package_hash,
+        export_count,
+        now,
+    );
+    store.persist_package(index, record.clone(), Some(payload_bytes))?;
+    Ok((record, false))
+}
+
+fn finalize_package_error(
+    settings: &ImporterSettings,
+    mut record: PackageRecord,
+    state: ImporterPackageState,
+    reason: String,
+) -> anyhow::Result<()> {
+    let mut index = settings.store.load_index()?;
+    record.state = state;
+    record.reason = Some(reason);
+    record.last_updated_at_unix_ms = unix_now_millis()?;
+    if state.is_terminal() {
+        record.completed_at_unix_ms = Some(record.last_updated_at_unix_ms);
+    }
+    settings.store.persist_package(&mut index, record, None)?;
+    settings.store.save_index(&index)
+}
+
+fn inspect_package_for_ingest(
+    package: &CertifiedSummaryPackage,
+    importer_domain: DomainId,
+) -> anyhow::Result<PackageIngestView> {
+    if package.inclusion_proofs.len() < 2 {
+        bail!("Phase 3A transport requires at least one export proof");
+    }
+
+    let mut target_domain = None;
+    let mut export_count = 0u32;
+    for (index, encoded) in package.inclusion_proofs.iter().enumerate() {
+        let proof = InclusionProof::decode(&mut &encoded[..])
+            .map_err(|error| anyhow!("failed to decode package inclusion proof: {error}"))?;
+        match (index, proof) {
+            (0, InclusionProof::SummaryHeaderStorageV1(_)) => {}
+            (0, InclusionProof::ExportV1(_)) => {
+                bail!("summary-header storage proof must remain at inclusion_proofs[0]")
+            }
+            (_, InclusionProof::SummaryHeaderStorageV1(_)) => {
+                bail!("summary-header storage proof may only appear at inclusion_proofs[0]")
+            }
+            (_, InclusionProof::ExportV1(proof)) => {
+                export_count = export_count.saturating_add(1);
+                match target_domain {
+                    Some(existing) if existing != proof.leaf.target_domain => {
+                        bail!("package contains mixed target domains")
+                    }
+                    None => target_domain = Some(proof.leaf.target_domain),
+                    _ => {}
+                }
+                if proof.leaf.source_domain != package.header.domain_id
+                    || proof.leaf.source_epoch_id != package.header.epoch_id
+                {
+                    bail!("package export proofs do not match source domain or epoch");
+                }
+            }
+        }
+    }
+
+    let target_domain = target_domain.ok_or_else(|| anyhow!("package has no export proofs"))?;
+    if target_domain != importer_domain {
+        bail!(
+            "package target domain {} does not match importer domain {}",
+            target_domain,
+            importer_domain
+        );
+    }
+
+    Ok(PackageIngestView {
+        source_domain: package.header.domain_id,
+        target_domain,
+        epoch_id: package.header.epoch_id,
+        export_count,
+    })
+}
+
+fn package_status_view(record: &PackageRecord) -> ImporterPackageStatusView {
+    ImporterPackageStatusView {
+        source_domain: record.source_domain,
+        target_domain: record.target_domain,
+        epoch_id: record.epoch_id,
+        package_hash: decode_hex_hash(&record.package_hash).unwrap_or([0u8; 32]),
+        summary_hash: decode_hex_hash(&record.summary_hash).unwrap_or([0u8; 32]),
+        state: record.state,
+        terminal: record.state.is_terminal(),
+        reason: record.reason.clone(),
+        export_count: record.export_count,
+        tx_hashes: record.tx_hashes.clone(),
+    }
 }
 
 fn verify_package_hash(package: &CertifiedSummaryPackage) -> anyhow::Result<()> {
@@ -475,9 +1066,13 @@ fn render_json(value: serde_json::Value, _as_json: bool) {
     );
 }
 
-struct ImporterSettings {
-    node_url: String,
-    store: Store,
+fn unix_now_millis() -> anyhow::Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is set before unix epoch")?
+        .as_millis()
+        .try_into()
+        .context("unix timestamp does not fit into u64")
 }
 
 impl ImporterSettings {
@@ -485,6 +1080,8 @@ impl ImporterSettings {
         domain: DomainId,
         node_url: Option<String>,
         store_dir: Option<PathBuf>,
+        transport_config: Option<PathBuf>,
+        submitter_suri: Option<String>,
     ) -> anyhow::Result<Self> {
         let loaded = load_domain_config(domain, None)
             .with_context(|| format!("failed to load importer config for domain {domain}"))?;
@@ -492,242 +1089,34 @@ impl ImporterSettings {
             .unwrap_or_else(|| format!("ws://127.0.0.1:{}", loaded.config.network.rpc_port));
         let store_dir =
             store_dir.unwrap_or_else(|| PathBuf::from("var/importer").join(domain.as_str()));
-        let store = Store::new(store_dir, domain)?;
-        Ok(Self { node_url, store })
+        let store = Arc::new(Store::new(store_dir, domain)?);
+        let listen_addr = transport_config
+            .map(|path| load_transport_config(Some(&path)))
+            .transpose()?
+            .map(|loaded| {
+                loaded
+                    .config
+                    .importers
+                    .get(&domain)
+                    .map(|config| config.listen_addr.clone())
+                    .ok_or_else(|| {
+                        anyhow!("transport config is missing importer endpoint for {domain}")
+                    })
+            })
+            .transpose()?;
+        Ok(Self {
+            domain,
+            node_url,
+            listen_addr,
+            store,
+            submitter_suri,
+        })
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ialp_common_types::{
-        export_merkle_root, ExportInclusionProof, ExportLeaf, ExportLeafHashInput,
-        GrandpaFinalityCertificate, SummaryCertificationBundle, SummaryHeaderStorageProof,
-        SUMMARY_HEADER_STORAGE_PROOF_VERSION,
-    };
-    use tempfile::tempdir;
-
-    fn sample_leaf(target_domain: DomainId) -> ExportLeaf {
-        ExportLeaf::from_hash_input(ExportLeafHashInput {
-            version: 1,
-            export_id: [9u8; 32],
-            source_domain: DomainId::Earth,
-            target_domain,
-            sender: [1u8; 32],
-            recipient: [2u8; 32],
-            amount: 50,
-            source_epoch_id: 3,
-            source_block_height: 11,
-            extrinsic_index: 0,
-        })
-    }
-
-    fn sample_package(target_domain: DomainId) -> CertifiedSummaryPackage {
-        let leaf = sample_leaf(target_domain);
-        let root = export_merkle_root(DomainId::Earth, 3, 10, 12, core::slice::from_ref(&leaf));
-        let header = ialp_common_types::EpochSummaryHeader {
-            version: 1,
-            domain_id: DomainId::Earth,
-            epoch_id: 3,
-            prev_summary_hash: [0u8; 32],
-            start_block_height: 10,
-            end_block_height: 12,
-            state_root: [1u8; 32],
-            block_root: [2u8; 32],
-            tx_root: [3u8; 32],
-            event_root: [4u8; 32],
-            export_root: root,
-            import_root: [5u8; 32],
-            governance_root: [6u8; 32],
-            validator_set_hash: [7u8; 32],
-            summary_hash: [8u8; 32],
-        };
-        let bundle = SummaryCertificationBundle {
-            certificate: SummaryCertificate::GrandpaV1(GrandpaFinalityCertificate {
-                version: 1,
-                grandpa_set_id: 0,
-                target_block_number: 13,
-                target_block_hash: [10u8; 32],
-                proof_block_number: 13,
-                proof_block_hash: [10u8; 32],
-                justification: Vec::new(),
-                ancestry_headers: Vec::new(),
-            }),
-            summary_header_storage_proof: SummaryHeaderStorageProof {
-                version: SUMMARY_HEADER_STORAGE_PROOF_VERSION,
-                proof_block_number: 13,
-                proof_block_hash: [10u8; 32],
-                proof_block_header: Vec::new(),
-                storage_key: summary_header_storage_key(3),
-                trie_nodes: Vec::new(),
-            },
-        };
-        CertifiedSummaryPackage::from_bundle_with_export_proofs(
-            header,
-            bundle,
-            vec![ExportInclusionProof {
-                version: ialp_common_types::EXPORT_INCLUSION_PROOF_VERSION,
-                leaf,
-                leaf_index: 0,
-                leaf_count: 1,
-                siblings: Vec::new(),
-            }],
-        )
-    }
-
-    #[test]
-    fn rejects_packages_without_export_proofs() {
-        let header = ialp_common_types::EpochSummaryHeader {
-            version: 1,
-            domain_id: DomainId::Earth,
-            epoch_id: 3,
-            prev_summary_hash: [0u8; 32],
-            start_block_height: 10,
-            end_block_height: 12,
-            state_root: [1u8; 32],
-            block_root: [2u8; 32],
-            tx_root: [3u8; 32],
-            event_root: [4u8; 32],
-            export_root: [5u8; 32],
-            import_root: [6u8; 32],
-            governance_root: [7u8; 32],
-            validator_set_hash: [8u8; 32],
-            summary_hash: [9u8; 32],
-        };
-        let package = CertifiedSummaryPackage::from_bundle(
-            header,
-            SummaryCertificationBundle {
-                certificate: SummaryCertificate::GrandpaV1(GrandpaFinalityCertificate {
-                    version: 1,
-                    grandpa_set_id: 0,
-                    target_block_number: 13,
-                    target_block_hash: [10u8; 32],
-                    proof_block_number: 13,
-                    proof_block_hash: [10u8; 32],
-                    justification: Vec::new(),
-                    ancestry_headers: Vec::new(),
-                }),
-                summary_header_storage_proof: SummaryHeaderStorageProof {
-                    version: SUMMARY_HEADER_STORAGE_PROOF_VERSION,
-                    proof_block_number: 13,
-                    proof_block_hash: [10u8; 32],
-                    proof_block_header: Vec::new(),
-                    storage_key: summary_header_storage_key(3),
-                    trie_nodes: Vec::new(),
-                },
-            },
-        );
-
-        let error = verify_export_proofs(&package, DomainId::Moon)
-            .expect_err("packages without export proofs should fail");
-        assert!(error.to_string().contains("at least one export proof"));
-    }
-
-    #[test]
-    fn rejects_packages_for_wrong_target_domain() {
-        let error = verify_export_proofs(&sample_package(DomainId::Moon), DomainId::Mars)
-            .expect_err("wrong target domain should fail");
-        assert!(error.to_string().contains("package target domain"));
-    }
-
-    #[test]
-    fn rejects_export_proofs_with_wrong_merkle_root() {
-        let mut package = sample_package(DomainId::Moon);
-        package.header.export_root = [0u8; 32];
-
-        let error =
-            verify_export_proofs(&package, DomainId::Moon).expect_err("wrong root should fail");
-        assert!(error
-            .to_string()
-            .contains("export inclusion proof failed against header.export_root"));
-    }
-
-    #[test]
-    fn rejects_mixed_target_domains_in_one_package() {
-        let moon_leaf = sample_leaf(DomainId::Moon);
-        let second_leaf = ExportLeaf::from_hash_input(ExportLeafHashInput {
-            version: 1,
-            export_id: [42u8; 32],
-            source_domain: DomainId::Earth,
-            target_domain: DomainId::Mars,
-            sender: [1u8; 32],
-            recipient: [2u8; 32],
-            amount: 50,
-            source_epoch_id: 3,
-            source_block_height: 11,
-            extrinsic_index: 1,
-        });
-        let root = export_merkle_root(
-            DomainId::Earth,
-            3,
-            10,
-            12,
-            &[moon_leaf.clone(), second_leaf.clone()],
-        );
-        let mut package = sample_package(DomainId::Moon);
-        package.header.export_root = root;
-        package.inclusion_proofs = vec![package.inclusion_proofs[0].clone()];
-        package.inclusion_proofs.push(
-            InclusionProof::ExportV1(
-                ialp_common_types::build_export_inclusion_proof(
-                    &[moon_leaf.clone(), second_leaf.clone()],
-                    moon_leaf.export_id,
-                )
-                .expect("proof"),
-            )
-            .encode(),
-        );
-        package.inclusion_proofs.push(
-            InclusionProof::ExportV1(
-                ialp_common_types::build_export_inclusion_proof(
-                    &[moon_leaf, second_leaf],
-                    [42u8; 32],
-                )
-                .expect("proof"),
-            )
-            .encode(),
-        );
-
-        let error = verify_export_proofs(&package, DomainId::Moon)
-            .expect_err("mixed target domains should fail");
-        assert!(error.to_string().contains("mixed target domains"));
-    }
-
-    #[test]
-    fn package_hash_check_detects_drift() {
-        let mut package = sample_package(DomainId::Moon);
-        package.package_hash = [0u8; 32];
-        assert!(verify_package_hash(&package).is_err());
-    }
-
-    #[test]
-    fn importer_store_persists_duplicate_marker_by_export_id() {
-        let root = tempdir().expect("tempdir");
-        let store = Store::new(root.path().to_path_buf(), DomainId::Moon).expect("store");
-        let mut index = store.load_index().expect("index");
-        let package = sample_package(DomainId::Moon);
-        let mut proofs = verify_export_proofs(&package, DomainId::Moon).expect("proofs");
-        let proof = proofs.remove(0);
-        let record = build_duplicate_record(
-            &package,
-            &proof,
-            DuplicateStatus::DuplicateLocal,
-            SubmissionStatus::SkippedDuplicate,
-            Some("duplicate".into()),
-        );
-
-        store
-            .persist_record(&mut index, record)
-            .expect("record persisted");
-        store.save_index(&index).expect("index saved");
-
-        let loaded = store
-            .load_record(proof.leaf.export_id)
-            .expect("load")
-            .expect("record exists");
-        assert!(matches!(
-            loaded.duplicate_status,
-            DuplicateStatus::DuplicateLocal
-        ));
-    }
+struct PackageIngestView {
+    source_domain: DomainId,
+    target_domain: DomainId,
+    epoch_id: u64,
+    export_count: u32,
 }

@@ -10,7 +10,9 @@ The exporter:
 - recomputes `header.export_root` locally before packaging
 - emits one deterministic package per `(epoch_id, target_domain)`
 - persists export-certified `CertifiedSummaryPackage` artifacts locally
+- submits certified packages to relay over HTTP using `RelayPackageEnvelopeV1`
+- tracks relay handoff state in schema-4 local storage
 - exposes operator inspection commands
 
-It does not yet implement relay transport, importer logic, or aggregator
-behavior.
+It still does not implement relay scheduling, importer verification, or
+aggregator behavior.

@@ -1,0 +1,68 @@
+[relay]
+listen_addr = "127.0.0.1:9950"
+store_dir = "var/relay"
+scheduler_tick_millis = 500
+ack_poll_millis = 500
+
+[importers.earth]
+listen_addr = "127.0.0.1:9951"
+
+[importers.moon]
+listen_addr = "127.0.0.1:9952"
+
+[importers.mars]
+listen_addr = "127.0.0.1:9953"
+
+[[links]]
+source_domain = "earth"
+target_domain = "moon"
+base_one_way_delay_seconds = 2
+initial_retry_delay_seconds = 1
+max_retry_delay_seconds = 30
+max_attempts = 0
+blackout_windows = []
+
+[[links]]
+source_domain = "earth"
+target_domain = "mars"
+base_one_way_delay_seconds = 4
+initial_retry_delay_seconds = 1
+max_retry_delay_seconds = 30
+max_attempts = 0
+blackout_windows = []
+
+[[links]]
+source_domain = "moon"
+target_domain = "earth"
+base_one_way_delay_seconds = 2
+initial_retry_delay_seconds = 1
+max_retry_delay_seconds = 30
+max_attempts = 0
+blackout_windows = []
+
+[[links]]
+source_domain = "moon"
+target_domain = "mars"
+base_one_way_delay_seconds = 3
+initial_retry_delay_seconds = 1
+max_retry_delay_seconds = 30
+max_attempts = 0
+blackout_windows = []
+
+[[links]]
+source_domain = "mars"
+target_domain = "earth"
+base_one_way_delay_seconds = 4
+initial_retry_delay_seconds = 1
+max_retry_delay_seconds = 30
+max_attempts = 0
+blackout_windows = []
+
+[[links]]
+source_domain = "mars"
+target_domain = "moon"
+base_one_way_delay_seconds = 3
+initial_retry_delay_seconds = 1
+max_retry_delay_seconds = 30
+max_attempts = 0
+blackout_windows = []

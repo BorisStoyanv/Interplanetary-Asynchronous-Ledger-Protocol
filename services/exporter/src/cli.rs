@@ -30,7 +30,11 @@ pub struct RunArgs {
     #[arg(long)]
     pub config: Option<PathBuf>,
     #[arg(long)]
+    pub transport_config: Option<PathBuf>,
+    #[arg(long)]
     pub node_url: Option<String>,
+    #[arg(long)]
+    pub relay_url: Option<String>,
     #[arg(long)]
     pub store_dir: Option<PathBuf>,
 }
