@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{bail, Context};
+use codec::Encode;
 use ialp_common_types::{DomainId, ImporterPackageState, RelayPackageEnvelopeV1};
 use serde::{Deserialize, Serialize};
 
@@ -80,6 +81,8 @@ pub struct RelayPackageRecord {
     pub state: RelayQueueState,
     pub relay_submitted_at_unix_ms: u64,
     pub relay_accepted_at_unix_ms: u64,
+    #[serde(default)]
+    pub ever_blocked_by_blackout: bool,
     pub next_delivery_at_unix_ms: Option<u64>,
     pub next_ack_poll_at_unix_ms: Option<u64>,
     pub delivery_attempts: u32,
@@ -105,6 +108,7 @@ impl RelayPackageRecord {
             "state": self.state,
             "relay_submitted_at_unix_ms": self.relay_submitted_at_unix_ms,
             "relay_accepted_at_unix_ms": self.relay_accepted_at_unix_ms,
+            "ever_blocked_by_blackout": self.ever_blocked_by_blackout,
             "next_delivery_at_unix_ms": self.next_delivery_at_unix_ms,
             "next_ack_poll_at_unix_ms": self.next_ack_poll_at_unix_ms,
             "delivery_attempts": self.delivery_attempts,
@@ -179,6 +183,7 @@ impl Store {
         envelope: &RelayPackageEnvelopeV1,
         relay_accepted_at_unix_ms: u64,
     ) -> anyhow::Result<(RelayPackageRecord, bool)> {
+        let encoded_envelope = envelope.encode();
         if let Some(existing) = index.record(
             envelope.source_domain,
             envelope.target_domain,
@@ -187,7 +192,7 @@ impl Store {
         ) {
             let current = fs::read(&existing.payload_path)
                 .with_context(|| format!("failed to read {}", existing.payload_path))?;
-            if current != envelope.package_bytes {
+            if current != encoded_envelope {
                 bail!(
                     "relay package identity already exists with different payload bytes for {}",
                     existing.package_hash
@@ -208,7 +213,7 @@ impl Store {
             envelope.epoch_id,
             envelope.package_hash,
         );
-        self.atomic_write(&payload_path, &envelope.package_bytes)?;
+        self.atomic_write(&payload_path, &encoded_envelope)?;
 
         let record = RelayPackageRecord {
             source_domain: envelope.source_domain,
@@ -220,6 +225,7 @@ impl Store {
             state: RelayQueueState::Queued,
             relay_submitted_at_unix_ms: envelope.relay_submitted_at_unix_ms,
             relay_accepted_at_unix_ms,
+            ever_blocked_by_blackout: false,
             next_delivery_at_unix_ms: None,
             next_ack_poll_at_unix_ms: None,
             delivery_attempts: 0,

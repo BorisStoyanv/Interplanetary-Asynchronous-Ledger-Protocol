@@ -1,6 +1,6 @@
 mod cli;
 mod rpc_client;
-mod store;
+pub mod store;
 
 use std::{
     path::PathBuf,
@@ -21,9 +21,9 @@ use clap::Parser;
 use codec::{Decode, Encode};
 use ialp_common_config::{load_domain_config, load_transport_config};
 use ialp_common_types::{
-    summary_header_storage_key, CertifiedSummaryPackage, DomainId, ImporterPackageState,
-    ImporterPackageStatusView, InclusionProof, ObservedImportClaim, RelayPackageEnvelopeV1,
-    SummaryCertificate,
+    summary_header_storage_key, CertifiedSummaryPackage, DomainId, FinalizedImportInclusionProof,
+    ImporterPackageState, ImporterPackageStatusView, InclusionProof, ObservedImportClaim,
+    RelayPackageEnvelopeV1, RemoteFinalizationClaim, SummaryCertificate,
 };
 use pallet_ialp_transfers::Call as TransfersCall;
 use sc_consensus_grandpa::GrandpaJustification;
@@ -68,6 +68,11 @@ struct ImporterIngestReceipt {
     accepted: bool,
     idempotent: bool,
     status: ImporterPackageStatusView,
+}
+
+enum VerifiedPackageFlow {
+    ForwardExports(Vec<ialp_common_types::ExportInclusionProof>),
+    SettlementCompletions(Vec<FinalizedImportInclusionProof>),
 }
 
 pub async fn run_cli() -> anyhow::Result<()> {
@@ -405,8 +410,8 @@ async fn process_package_by_identity(
         )?;
         return Ok(());
     }
-    let export_proofs = match verify_export_proofs(&package, settings.domain) {
-        Ok(export_proofs) => export_proofs,
+    let package_flow = match verify_package_flow(&package, settings.domain) {
+        Ok(flow) => flow,
         Err(error) => {
             finalize_package_error(
                 settings,
@@ -512,134 +517,68 @@ async fn process_package_by_identity(
         }
     };
 
-    let mut index = settings.store.load_index()?;
-    let mut tx_hashes = Vec::new();
-    let mut duplicate_local = 0usize;
-    let mut duplicate_remote = 0usize;
-    let mut observed_new = 0usize;
-
-    for proof in export_proofs {
-        let export_id = proof.leaf.export_id;
-        if index.record(export_id).is_some() {
-            duplicate_local = duplicate_local.saturating_add(1);
-            continue;
-        }
-        if rpc.observed_import(export_id).await?.is_some() {
-            duplicate_remote = duplicate_remote.saturating_add(1);
-            let record = build_duplicate_record(
+    let outcome = match package_flow {
+        VerifiedPackageFlow::ForwardExports(export_proofs) => {
+            process_forward_exports(
+                settings,
+                &rpc,
+                &submitter_pair,
+                &submitter_account,
+                runtime_version.spec_version,
+                runtime_version.transaction_version,
+                genesis_hash,
                 &package,
-                &proof,
-                DuplicateStatus::DuplicateRemote,
-                SubmissionStatus::SkippedDuplicate,
-                Some("export_id already observed on destination chain".into()),
-            );
-            settings.store.persist_record(&mut index, record)?;
-            continue;
+                export_proofs,
+            )
+            .await
         }
+        VerifiedPackageFlow::SettlementCompletions(finalized_import_proofs) => {
+            process_settlement_completions(
+                settings,
+                &rpc,
+                &submitter_pair,
+                &submitter_account,
+                runtime_version.spec_version,
+                runtime_version.transaction_version,
+                genesis_hash,
+                &package,
+                finalized_import_proofs,
+            )
+            .await
+        }
+    };
 
-        let claim = ObservedImportClaim {
-            version: ialp_common_types::OBSERVED_IMPORT_VERSION,
-            export_id: proof.leaf.export_id,
-            source_domain: proof.leaf.source_domain,
-            target_domain: proof.leaf.target_domain,
-            source_epoch_id: proof.leaf.source_epoch_id,
-            summary_hash: package.header.summary_hash,
-            package_hash: package.package_hash,
-            recipient: proof.leaf.recipient,
-            amount: proof.leaf.amount,
-        };
-        let nonce = match rpc.account_next_index(&submitter_account).await {
-            Ok(nonce) => nonce,
-            Err(error) => {
-                settings.store.save_index(&index)?;
-                finalize_package_error(
-                    settings,
-                    package_record,
-                    ImporterPackageState::SubmissionRetrying,
-                    error.to_string(),
-                )?;
-                return Ok(());
-            }
-        };
-        let extrinsic = match build_observed_import_extrinsic(
-            &submitter_pair,
-            submitter_account.clone(),
-            runtime_version.spec_version,
-            runtime_version.transaction_version,
-            genesis_hash,
-            nonce,
-            claim.clone(),
-        ) {
-            Ok(extrinsic) => extrinsic,
-            Err(error) => {
-                finalize_package_error(
-                    settings,
-                    package_record,
-                    ImporterPackageState::AckedInvalid,
-                    error.to_string(),
-                )?;
-                return Ok(());
-            }
-        };
-        let tx_hash = match rpc.submit_extrinsic(extrinsic).await {
-            Ok(tx_hash) => tx_hash,
-            Err(error) => {
-                settings.store.save_index(&index)?;
-                finalize_package_error(
-                    settings,
-                    package_record,
-                    ImporterPackageState::SubmissionRetrying,
-                    error.to_string(),
-                )?;
-                return Ok(());
-            }
-        };
-
-        let record = ImportRecord {
-            export_id: hex_hash(export_id),
-            source_domain: proof.leaf.source_domain,
-            target_domain: proof.leaf.target_domain,
-            summary_hash: hex_hash(package.header.summary_hash),
-            package_hash: hex_hash(package.package_hash),
-            verification_status: VerificationStatus::Verified,
-            duplicate_status: DuplicateStatus::NotDuplicate,
-            submission_status: SubmissionStatus::RemoteObserved,
-            tx_hash: Some(tx_hash.clone()),
-            reason: Some("remote_observed recorded".into()),
-        };
-        settings.store.persist_record(&mut index, record)?;
-        tx_hashes.push(tx_hash);
-        observed_new = observed_new.saturating_add(1);
-    }
-
-    let final_state = if observed_new > 0 {
-        ImporterPackageState::AckedVerified
-    } else if duplicate_local > 0 && duplicate_remote == 0 {
-        ImporterPackageState::AckedDuplicateLocal
-    } else if duplicate_remote > 0 && duplicate_local == 0 {
-        ImporterPackageState::AckedDuplicateRemote
-    } else {
-        ImporterPackageState::AckedVerified
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(ProcessPackageError::Retryable(message)) => {
+            finalize_package_error(
+                settings,
+                package_record,
+                ImporterPackageState::SubmissionRetrying,
+                message,
+            )?;
+            return Ok(());
+        }
+        Err(ProcessPackageError::Invalid(message)) => {
+            finalize_package_error(
+                settings,
+                package_record,
+                ImporterPackageState::AckedInvalid,
+                message,
+            )?;
+            return Ok(());
+        }
     };
 
     let mut refreshed_package = settings
         .store
         .load_package(source_domain, target_domain, epoch_id, package_hash)?
         .ok_or_else(|| anyhow!("package disappeared during processing"))?;
-    refreshed_package.state = final_state;
-    refreshed_package.tx_hashes = tx_hashes;
+    refreshed_package.state = outcome.final_state;
+    refreshed_package.tx_hashes = outcome.tx_hashes;
     refreshed_package.completed_at_unix_ms = Some(unix_now_millis()?);
     refreshed_package.last_updated_at_unix_ms = refreshed_package.completed_at_unix_ms.unwrap();
-    refreshed_package.reason = Some(match final_state {
-        ImporterPackageState::AckedVerified => {
-            "package verified and remote_observed recorded or already known".into()
-        }
-        ImporterPackageState::AckedDuplicateLocal => "all exports already processed locally".into(),
-        ImporterPackageState::AckedDuplicateRemote => {
-            "all exports already observed on destination chain".into()
-        }
-        _ => "package processing completed".into(),
-    });
+    refreshed_package.reason = Some(outcome.reason);
     settings
         .store
         .persist_package(&mut index, refreshed_package, None)?;
@@ -697,29 +636,403 @@ fn finalize_package_error(
     settings.store.save_index(&index)
 }
 
+enum ProcessPackageError {
+    Retryable(String),
+    Invalid(String),
+}
+
+struct ProcessPackageOutcome {
+    final_state: ImporterPackageState,
+    tx_hashes: Vec<String>,
+    reason: String,
+}
+
+async fn process_forward_exports(
+    settings: &ImporterSettings,
+    rpc: &NodeRpcClient,
+    submitter_pair: &sr25519::Pair,
+    submitter_account: &ialp_runtime::AccountId,
+    spec_version: u32,
+    transaction_version: u32,
+    genesis_hash: H256,
+    package: &CertifiedSummaryPackage,
+    export_proofs: Vec<ialp_common_types::ExportInclusionProof>,
+) -> Result<ProcessPackageOutcome, ProcessPackageError> {
+    let mut index = settings
+        .store
+        .load_index()
+        .map_err(|error| ProcessPackageError::Retryable(error.to_string()))?;
+    let mut tx_hashes = Vec::new();
+    let mut duplicate_local = 0usize;
+    let mut duplicate_remote = 0usize;
+    let mut finalized = 0usize;
+
+    for proof in export_proofs {
+        let export_id = proof.leaf.export_id;
+        if index.record(export_id).is_some() {
+            duplicate_local = duplicate_local.saturating_add(1);
+            continue;
+        }
+
+        let existing_remote = rpc
+            .observed_import(export_id)
+            .await
+            .map_err(|error| ProcessPackageError::Retryable(error.to_string()))?;
+        if let Some(ref record) = existing_remote {
+            if record.status == ialp_common_types::ImportObservationStatus::RemoteFinalized {
+                duplicate_remote = duplicate_remote.saturating_add(1);
+                settings
+                    .store
+                    .persist_record(
+                        &mut index,
+                        ImportRecord {
+                            export_id: hex_hash(export_id),
+                            source_domain: proof.leaf.source_domain,
+                            target_domain: proof.leaf.target_domain,
+                            summary_hash: hex_hash(package.header.summary_hash),
+                            package_hash: hex_hash(package.package_hash),
+                            verification_status: VerificationStatus::Verified,
+                            duplicate_status: DuplicateStatus::DuplicateRemote,
+                            submission_status: SubmissionStatus::RemoteFinalized,
+                            tx_hash: None,
+                            reason: Some("export_id already remote_finalized on destination chain".into()),
+                        },
+                    )
+                    .map_err(|error| ProcessPackageError::Retryable(error.to_string()))?;
+                continue;
+            }
+        }
+
+        let mut next_nonce = rpc
+            .account_next_index(submitter_account)
+            .await
+            .map_err(|error| ProcessPackageError::Retryable(error.to_string()))?;
+
+        if existing_remote.is_none() {
+            let claim = ObservedImportClaim {
+                version: ialp_common_types::OBSERVED_IMPORT_VERSION,
+                export_id: proof.leaf.export_id,
+                source_domain: proof.leaf.source_domain,
+                target_domain: proof.leaf.target_domain,
+                source_epoch_id: proof.leaf.source_epoch_id,
+                summary_hash: package.header.summary_hash,
+                package_hash: package.package_hash,
+                recipient: proof.leaf.recipient,
+                amount: proof.leaf.amount,
+            };
+            let extrinsic = build_observed_import_extrinsic(
+                submitter_pair,
+                submitter_account.clone(),
+                spec_version,
+                transaction_version,
+                genesis_hash,
+                next_nonce,
+                claim,
+            )
+            .map_err(|error| ProcessPackageError::Invalid(error.to_string()))?;
+            let tx_hash = rpc
+                .submit_extrinsic(extrinsic)
+                .await
+                .map_err(|error| ProcessPackageError::Retryable(error.to_string()))?;
+            tx_hashes.push(tx_hash);
+            next_nonce = next_nonce.saturating_add(1);
+        }
+
+        let finalize_extrinsic = build_finalize_verified_import_extrinsic(
+            submitter_pair,
+            submitter_account.clone(),
+            spec_version,
+            transaction_version,
+            genesis_hash,
+            next_nonce,
+            export_id,
+        )
+        .map_err(|error| ProcessPackageError::Invalid(error.to_string()))?;
+        let finalize_tx = rpc
+            .submit_extrinsic(finalize_extrinsic)
+            .await
+            .map_err(|error| ProcessPackageError::Retryable(error.to_string()))?;
+        tx_hashes.push(finalize_tx.clone());
+
+        wait_for_observed_import_status(
+            rpc,
+            export_id,
+            ialp_common_types::ImportObservationStatus::RemoteFinalized,
+        )
+        .await
+        .map_err(ProcessPackageError::Retryable)?;
+
+        settings
+            .store
+            .persist_record(
+                &mut index,
+                ImportRecord {
+                    export_id: hex_hash(export_id),
+                    source_domain: proof.leaf.source_domain,
+                    target_domain: proof.leaf.target_domain,
+                    summary_hash: hex_hash(package.header.summary_hash),
+                    package_hash: hex_hash(package.package_hash),
+                    verification_status: VerificationStatus::Verified,
+                    duplicate_status: DuplicateStatus::NotDuplicate,
+                    submission_status: SubmissionStatus::RemoteFinalized,
+                    tx_hash: Some(finalize_tx),
+                    reason: Some("remote_finalized recorded".into()),
+                },
+            )
+            .map_err(|error| ProcessPackageError::Retryable(error.to_string()))?;
+        finalized = finalized.saturating_add(1);
+    }
+
+    settings
+        .store
+        .save_index(&index)
+        .map_err(|error| ProcessPackageError::Retryable(error.to_string()))?;
+
+    let final_state = if finalized > 0 {
+        ImporterPackageState::AckedVerified
+    } else if duplicate_local > 0 && duplicate_remote == 0 {
+        ImporterPackageState::AckedDuplicateLocal
+    } else if duplicate_remote > 0 && duplicate_local == 0 {
+        ImporterPackageState::AckedDuplicateRemote
+    } else {
+        ImporterPackageState::AckedVerified
+    };
+
+    let reason = match final_state {
+        ImporterPackageState::AckedVerified => {
+            "package verified and remote_finalized recorded or already known".into()
+        }
+        ImporterPackageState::AckedDuplicateLocal => "all exports already processed locally".into(),
+        ImporterPackageState::AckedDuplicateRemote => {
+            "all exports already remote_finalized on destination chain".into()
+        }
+        _ => "package processing completed".into(),
+    };
+
+    Ok(ProcessPackageOutcome {
+        final_state,
+        tx_hashes,
+        reason,
+    })
+}
+
+async fn process_settlement_completions(
+    settings: &ImporterSettings,
+    rpc: &NodeRpcClient,
+    submitter_pair: &sr25519::Pair,
+    submitter_account: &ialp_runtime::AccountId,
+    spec_version: u32,
+    transaction_version: u32,
+    genesis_hash: H256,
+    package: &CertifiedSummaryPackage,
+    finalized_import_proofs: Vec<FinalizedImportInclusionProof>,
+) -> Result<ProcessPackageOutcome, ProcessPackageError> {
+    let mut index = settings
+        .store
+        .load_index()
+        .map_err(|error| ProcessPackageError::Retryable(error.to_string()))?;
+    let mut tx_hashes = Vec::new();
+    let mut duplicate_local = 0usize;
+    let mut resolved = 0usize;
+
+    for proof in finalized_import_proofs {
+        let export_id = proof.leaf.export_id;
+        if index.record(export_id).is_some() {
+            duplicate_local = duplicate_local.saturating_add(1);
+            continue;
+        }
+
+        let existing_export = rpc
+            .export_record(export_id)
+            .await
+            .map_err(|error| ProcessPackageError::Retryable(error.to_string()))?
+            .ok_or_else(|| {
+                ProcessPackageError::Invalid(format!(
+                    "source chain is missing export record 0x{}",
+                    hex::encode(export_id)
+                ))
+            })?;
+        if existing_export.status == ialp_common_types::ExportStatus::RemoteFinalized {
+            settings
+                .store
+                .persist_record(
+                    &mut index,
+                    ImportRecord {
+                        export_id: hex_hash(export_id),
+                        source_domain: proof.leaf.source_domain,
+                        target_domain: proof.leaf.target_domain,
+                        summary_hash: hex_hash(package.header.summary_hash),
+                        package_hash: hex_hash(package.package_hash),
+                        verification_status: VerificationStatus::Verified,
+                        duplicate_status: DuplicateStatus::DuplicateRemote,
+                        submission_status: SubmissionStatus::SourceResolved,
+                        tx_hash: None,
+                        reason: Some("source export already remote_finalized".into()),
+                    },
+                )
+                .map_err(|error| ProcessPackageError::Retryable(error.to_string()))?;
+            continue;
+        }
+
+        let claim = RemoteFinalizationClaim {
+            version: ialp_common_types::REMOTE_FINALIZATION_CLAIM_VERSION,
+            export_id,
+            source_domain: proof.leaf.source_domain,
+            target_domain: proof.leaf.target_domain,
+            source_epoch_id: proof.leaf.source_epoch_id,
+            recipient: proof.leaf.recipient,
+            amount: proof.leaf.amount,
+            completion_summary_hash: package.header.summary_hash,
+            completion_package_hash: package.package_hash,
+        };
+        let nonce = rpc
+            .account_next_index(submitter_account)
+            .await
+            .map_err(|error| ProcessPackageError::Retryable(error.to_string()))?;
+        let extrinsic = build_acknowledge_remote_finalization_extrinsic(
+            submitter_pair,
+            submitter_account.clone(),
+            spec_version,
+            transaction_version,
+            genesis_hash,
+            nonce,
+            claim,
+        )
+        .map_err(|error| ProcessPackageError::Invalid(error.to_string()))?;
+        let tx_hash = rpc
+            .submit_extrinsic(extrinsic)
+            .await
+            .map_err(|error| ProcessPackageError::Retryable(error.to_string()))?;
+
+        wait_for_export_record_status(
+            rpc,
+            export_id,
+            ialp_common_types::ExportStatus::RemoteFinalized,
+        )
+        .await
+        .map_err(ProcessPackageError::Retryable)?;
+
+        settings
+            .store
+            .persist_record(
+                &mut index,
+                ImportRecord {
+                    export_id: hex_hash(export_id),
+                    source_domain: proof.leaf.source_domain,
+                    target_domain: proof.leaf.target_domain,
+                    summary_hash: hex_hash(package.header.summary_hash),
+                    package_hash: hex_hash(package.package_hash),
+                    verification_status: VerificationStatus::Verified,
+                    duplicate_status: DuplicateStatus::NotDuplicate,
+                    submission_status: SubmissionStatus::SourceResolved,
+                    tx_hash: Some(tx_hash.clone()),
+                    reason: Some("source hold resolved from certified remote_finalized proof".into()),
+                },
+            )
+            .map_err(|error| ProcessPackageError::Retryable(error.to_string()))?;
+        tx_hashes.push(tx_hash);
+        resolved = resolved.saturating_add(1);
+    }
+
+    settings
+        .store
+        .save_index(&index)
+        .map_err(|error| ProcessPackageError::Retryable(error.to_string()))?;
+
+    let final_state = if resolved > 0 {
+        ImporterPackageState::AckedVerified
+    } else if duplicate_local > 0 {
+        ImporterPackageState::AckedDuplicateLocal
+    } else {
+        ImporterPackageState::AckedDuplicateRemote
+    };
+    let reason = match final_state {
+        ImporterPackageState::AckedVerified => {
+            "completion package verified and source holds resolved".into()
+        }
+        ImporterPackageState::AckedDuplicateLocal => {
+            "all completion proofs already processed locally".into()
+        }
+        ImporterPackageState::AckedDuplicateRemote => {
+            "all source exports were already remote_finalized".into()
+        }
+        _ => "package processing completed".into(),
+    };
+
+    Ok(ProcessPackageOutcome {
+        final_state,
+        tx_hashes,
+        reason,
+    })
+}
+
+async fn wait_for_observed_import_status(
+    rpc: &NodeRpcClient,
+    export_id: ialp_common_types::ExportId,
+    expected: ialp_common_types::ImportObservationStatus,
+) -> Result<(), String> {
+    for _ in 0..60 {
+        match rpc.observed_import(export_id).await {
+            Ok(Some(record)) if record.status == expected => return Ok(()),
+            Ok(_) => sleep(Duration::from_millis(PROCESSOR_TICK_MILLIS)).await,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err(format!(
+        "timed out waiting for observed import 0x{} to reach status {:?}",
+        hex::encode(export_id),
+        expected
+    ))
+}
+
+async fn wait_for_export_record_status(
+    rpc: &NodeRpcClient,
+    export_id: ialp_common_types::ExportId,
+    expected: ialp_common_types::ExportStatus,
+) -> Result<(), String> {
+    for _ in 0..60 {
+        match rpc.export_record(export_id).await {
+            Ok(Some(record)) if record.status == expected => return Ok(()),
+            Ok(_) => sleep(Duration::from_millis(PROCESSOR_TICK_MILLIS)).await,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err(format!(
+        "timed out waiting for export record 0x{} to reach status {:?}",
+        hex::encode(export_id),
+        expected
+    ))
+}
+
 fn inspect_package_for_ingest(
     package: &CertifiedSummaryPackage,
     importer_domain: DomainId,
 ) -> anyhow::Result<PackageIngestView> {
     if package.inclusion_proofs.len() < 2 {
-        bail!("Phase 3A transport requires at least one export proof");
+        bail!("transport packages require at least one non-summary inclusion proof");
     }
 
     let mut target_domain = None;
-    let mut export_count = 0u32;
+    let mut item_count = 0u32;
+    let mut flow_kind = None;
     for (index, encoded) in package.inclusion_proofs.iter().enumerate() {
         let proof = InclusionProof::decode(&mut &encoded[..])
             .map_err(|error| anyhow!("failed to decode package inclusion proof: {error}"))?;
         match (index, proof) {
             (0, InclusionProof::SummaryHeaderStorageV1(_)) => {}
-            (0, InclusionProof::ExportV1(_)) => {
+            (0, InclusionProof::ExportV1(_) | InclusionProof::FinalizedImportV1(_)) => {
                 bail!("summary-header storage proof must remain at inclusion_proofs[0]")
             }
             (_, InclusionProof::SummaryHeaderStorageV1(_)) => {
                 bail!("summary-header storage proof may only appear at inclusion_proofs[0]")
             }
             (_, InclusionProof::ExportV1(proof)) => {
-                export_count = export_count.saturating_add(1);
+                item_count = item_count.saturating_add(1);
+                match flow_kind {
+                    Some("completion") => bail!("package mixes forward export proofs with completion proofs"),
+                    None => flow_kind = Some("forward"),
+                    _ => {}
+                }
                 match target_domain {
                     Some(existing) if existing != proof.leaf.target_domain => {
                         bail!("package contains mixed target domains")
@@ -728,15 +1041,34 @@ fn inspect_package_for_ingest(
                     _ => {}
                 }
                 if proof.leaf.source_domain != package.header.domain_id
-                    || proof.leaf.source_epoch_id != package.header.epoch_id
+                        || proof.leaf.source_epoch_id != package.header.epoch_id
                 {
                     bail!("package export proofs do not match source domain or epoch");
+                }
+            }
+            (_, InclusionProof::FinalizedImportV1(proof)) => {
+                item_count = item_count.saturating_add(1);
+                match flow_kind {
+                    Some("forward") => bail!("package mixes completion proofs with forward export proofs"),
+                    None => flow_kind = Some("completion"),
+                    _ => {}
+                }
+                match target_domain {
+                    Some(existing) if existing != proof.leaf.source_domain => {
+                        bail!("completion package contains mixed source domains")
+                    }
+                    None => target_domain = Some(proof.leaf.source_domain),
+                    _ => {}
+                }
+                if proof.leaf.target_domain != package.header.domain_id {
+                    bail!("completion proof leaf target domain does not match package source domain");
                 }
             }
         }
     }
 
-    let target_domain = target_domain.ok_or_else(|| anyhow!("package has no export proofs"))?;
+    let target_domain =
+        target_domain.ok_or_else(|| anyhow!("package has no supported inclusion proofs"))?;
     if target_domain != importer_domain {
         bail!(
             "package target domain {} does not match importer domain {}",
@@ -749,7 +1081,7 @@ fn inspect_package_for_ingest(
         source_domain: package.header.domain_id,
         target_domain,
         epoch_id: package.header.epoch_id,
-        export_count,
+        export_count: item_count,
     })
 }
 
@@ -897,14 +1229,33 @@ fn verify_grandpa_certificate(
     Ok(())
 }
 
-fn verify_export_proofs(
+fn verify_package_flow(
+    package: &CertifiedSummaryPackage,
+    importer_domain: DomainId,
+) -> anyhow::Result<VerifiedPackageFlow> {
+    if package.inclusion_proofs.len() < 2 {
+        bail!("package must include at least one non-summary inclusion proof");
+    }
+
+    match InclusionProof::decode(&mut &package.inclusion_proofs[1][..])
+        .map_err(|error| anyhow!("failed to decode inclusion proof: {error}"))?
+    {
+        InclusionProof::SummaryHeaderStorageV1(_) => {
+            bail!("summary-header proof may appear only at inclusion_proofs[0]")
+        }
+        InclusionProof::ExportV1(_) => verify_forward_export_proofs(package, importer_domain)
+            .map(VerifiedPackageFlow::ForwardExports),
+        InclusionProof::FinalizedImportV1(_) => {
+            verify_finalized_import_proofs(package, importer_domain)
+                .map(VerifiedPackageFlow::SettlementCompletions)
+        }
+    }
+}
+
+fn verify_forward_export_proofs(
     package: &CertifiedSummaryPackage,
     importer_domain: DomainId,
 ) -> anyhow::Result<Vec<ialp_common_types::ExportInclusionProof>> {
-    if package.inclusion_proofs.len() < 2 {
-        bail!("Phase 2B package must include at least one export proof");
-    }
-
     let mut export_proofs = Vec::new();
     let mut package_target_domain = None;
     for encoded in &package.inclusion_proofs[1..] {
@@ -914,6 +1265,9 @@ fn verify_export_proofs(
             InclusionProof::ExportV1(proof) => proof,
             InclusionProof::SummaryHeaderStorageV1(_) => {
                 bail!("summary-header proof may appear only at inclusion_proofs[0]")
+            }
+            InclusionProof::FinalizedImportV1(_) => {
+                bail!("package mixes finalized-import proofs into a forward export package")
             }
         };
 
@@ -949,6 +1303,56 @@ fn verify_export_proofs(
     Ok(export_proofs)
 }
 
+fn verify_finalized_import_proofs(
+    package: &CertifiedSummaryPackage,
+    importer_domain: DomainId,
+) -> anyhow::Result<Vec<FinalizedImportInclusionProof>> {
+    let mut proofs = Vec::new();
+    let mut package_target_domain = None;
+    for encoded in &package.inclusion_proofs[1..] {
+        let proof = match InclusionProof::decode(&mut &encoded[..])
+            .map_err(|error| anyhow!("failed to decode inclusion proof: {error}"))?
+        {
+            InclusionProof::FinalizedImportV1(proof) => proof,
+            InclusionProof::SummaryHeaderStorageV1(_) => {
+                bail!("summary-header proof may appear only at inclusion_proofs[0]")
+            }
+            InclusionProof::ExportV1(_) => {
+                bail!("package mixes forward export proofs into a completion package")
+            }
+        };
+
+        if proof.leaf.import_hash != proof.leaf.compute_import_hash() {
+            bail!("finalized-import proof leaf hash does not match canonical finalized import leaf contents");
+        }
+        if proof.leaf.target_domain != package.header.domain_id {
+            bail!("finalized-import proof leaf target domain does not match package source domain");
+        }
+        match package_target_domain {
+            Some(target_domain) if target_domain != proof.leaf.source_domain => {
+                bail!("completion package contains mixed source domains across finalized-import proofs")
+            }
+            None => package_target_domain = Some(proof.leaf.source_domain),
+            _ => {}
+        }
+        if proof.leaf.source_domain != importer_domain {
+            bail!(
+                "completion package target domain {} does not match importer domain {}",
+                proof.leaf.source_domain,
+                importer_domain
+            );
+        }
+        if !ialp_common_types::verify_finalized_import_inclusion_proof(package.header.import_root, &proof)
+        {
+            bail!("finalized-import inclusion proof failed against header.import_root");
+        }
+
+        proofs.push(proof);
+    }
+
+    Ok(proofs)
+}
+
 fn decode_summary_storage_proof(
     bytes: &[u8],
 ) -> anyhow::Result<ialp_common_types::SummaryHeaderStorageProof> {
@@ -956,7 +1360,9 @@ fn decode_summary_storage_proof(
         .map_err(|error| anyhow!("failed to decode summary proof: {error}"))?
     {
         InclusionProof::SummaryHeaderStorageV1(proof) => Ok(proof),
-        InclusionProof::ExportV1(_) => bail!("expected summary-header storage proof at index 0"),
+        InclusionProof::ExportV1(_) | InclusionProof::FinalizedImportV1(_) => {
+            bail!("expected summary-header storage proof at index 0")
+        }
     }
 }
 
@@ -1025,25 +1431,93 @@ fn build_observed_import_extrinsic(
     Ok(extrinsic.encode())
 }
 
-fn build_duplicate_record(
-    package: &CertifiedSummaryPackage,
-    proof: &ialp_common_types::ExportInclusionProof,
-    duplicate_status: DuplicateStatus,
-    submission_status: SubmissionStatus,
-    reason: Option<String>,
-) -> ImportRecord {
-    ImportRecord {
-        export_id: hex_hash(proof.leaf.export_id),
-        source_domain: proof.leaf.source_domain,
-        target_domain: proof.leaf.target_domain,
-        summary_hash: hex_hash(package.header.summary_hash),
-        package_hash: hex_hash(package.package_hash),
-        verification_status: VerificationStatus::Verified,
-        duplicate_status,
-        submission_status,
-        tx_hash: None,
-        reason,
-    }
+fn build_finalize_verified_import_extrinsic(
+    submitter_pair: &sr25519::Pair,
+    account_id: ialp_runtime::AccountId,
+    spec_version: u32,
+    transaction_version: u32,
+    genesis_hash: H256,
+    nonce: u32,
+    export_id: ialp_common_types::ExportId,
+) -> anyhow::Result<Vec<u8>> {
+    let call =
+        ialp_runtime::RuntimeCall::Transfers(TransfersCall::finalize_verified_import { export_id });
+    let extra = (
+        frame_system::CheckNonZeroSender::<ialp_runtime::Runtime>::new(),
+        frame_system::CheckSpecVersion::<ialp_runtime::Runtime>::new(),
+        frame_system::CheckTxVersion::<ialp_runtime::Runtime>::new(),
+        frame_system::CheckGenesis::<ialp_runtime::Runtime>::new(),
+        frame_system::CheckEra::<ialp_runtime::Runtime>::from(Era::Immortal),
+        frame_system::CheckNonce::<ialp_runtime::Runtime>::from(nonce),
+        frame_system::CheckWeight::<ialp_runtime::Runtime>::new(),
+        pallet_transaction_payment::ChargeTransactionPayment::<ialp_runtime::Runtime>::from(0u128),
+        frame_system::WeightReclaim::<ialp_runtime::Runtime>::new(),
+    );
+    let implicit = (
+        (),
+        spec_version,
+        transaction_version,
+        genesis_hash,
+        genesis_hash,
+        (),
+        (),
+        (),
+        (),
+    );
+    let payload = ialp_runtime::SignedPayload::from_raw(call.clone(), extra.clone(), implicit);
+    let signature: MultiSignature = submitter_pair.sign(&payload.encode()).into();
+    let extrinsic = ialp_runtime::UncheckedExtrinsic::new_signed(
+        call,
+        MultiAddress::Id(account_id),
+        signature,
+        extra,
+    );
+    Ok(extrinsic.encode())
+}
+
+fn build_acknowledge_remote_finalization_extrinsic(
+    submitter_pair: &sr25519::Pair,
+    account_id: ialp_runtime::AccountId,
+    spec_version: u32,
+    transaction_version: u32,
+    genesis_hash: H256,
+    nonce: u32,
+    claim: RemoteFinalizationClaim,
+) -> anyhow::Result<Vec<u8>> {
+    let call = ialp_runtime::RuntimeCall::Transfers(
+        TransfersCall::acknowledge_remote_finalization { claim },
+    );
+    let extra = (
+        frame_system::CheckNonZeroSender::<ialp_runtime::Runtime>::new(),
+        frame_system::CheckSpecVersion::<ialp_runtime::Runtime>::new(),
+        frame_system::CheckTxVersion::<ialp_runtime::Runtime>::new(),
+        frame_system::CheckGenesis::<ialp_runtime::Runtime>::new(),
+        frame_system::CheckEra::<ialp_runtime::Runtime>::from(Era::Immortal),
+        frame_system::CheckNonce::<ialp_runtime::Runtime>::from(nonce),
+        frame_system::CheckWeight::<ialp_runtime::Runtime>::new(),
+        pallet_transaction_payment::ChargeTransactionPayment::<ialp_runtime::Runtime>::from(0u128),
+        frame_system::WeightReclaim::<ialp_runtime::Runtime>::new(),
+    );
+    let implicit = (
+        (),
+        spec_version,
+        transaction_version,
+        genesis_hash,
+        genesis_hash,
+        (),
+        (),
+        (),
+        (),
+    );
+    let payload = ialp_runtime::SignedPayload::from_raw(call.clone(), extra.clone(), implicit);
+    let signature: MultiSignature = submitter_pair.sign(&payload.encode()).into();
+    let extrinsic = ialp_runtime::UncheckedExtrinsic::new_signed(
+        call,
+        MultiAddress::Id(account_id),
+        signature,
+        extra,
+    );
+    Ok(extrinsic.encode())
 }
 
 fn hex_hash(hash: [u8; 32]) -> String {

@@ -293,10 +293,23 @@ impl pallet_ialp_epochs::ExportCommitmentProvider for EpochExportCommitmentRunti
     }
 }
 
+pub struct EpochImportCommitmentRuntimeProvider;
+
+impl pallet_ialp_epochs::ImportCommitmentProvider for EpochImportCommitmentRuntimeProvider {
+    fn commit_epoch_imports(
+        epoch_id: ialp_common_types::EpochId,
+        start_block_height: u32,
+        end_block_height: u32,
+    ) -> [u8; 32] {
+        Transfers::commit_epoch_imports(epoch_id, start_block_height, end_block_height)
+    }
+}
+
 impl pallet_ialp_epochs::Config for Runtime {
     type RuntimeEvent = RuntimeEvent;
     type SummaryContext = EpochSummaryRuntimeContext;
     type ExportCommitmentProvider = EpochExportCommitmentRuntimeProvider;
+    type ImportCommitmentProvider = EpochImportCommitmentRuntimeProvider;
 }
 
 pub struct TransferDomainIdentityRuntimeProvider;

@@ -1,5 +1,5 @@
 mod cli;
-mod store;
+pub mod store;
 
 use std::{
     path::PathBuf,
@@ -264,8 +264,12 @@ async fn schedule_record(app: &Arc<AppState>, record: RelayPackageRecord) -> any
     } else {
         RelayQueueState::BlockedByBlackout
     };
+    let blocked = matches!(next_state, RelayQueueState::BlockedByBlackout);
     update_record(app, &record, move |current| {
         current.state = next_state;
+        if blocked {
+            current.ever_blocked_by_blackout = true;
+        }
         current.next_delivery_at_unix_ms = Some(scheduled_at);
         current.last_delivery_error = None;
     })
@@ -284,6 +288,7 @@ async fn attempt_delivery(app: &Arc<AppState>, record: RelayPackageRecord) -> an
         if blocked_until > now {
             return update_record(app, &record, move |current| {
                 current.state = RelayQueueState::BlockedByBlackout;
+                current.ever_blocked_by_blackout = true;
                 current.next_delivery_at_unix_ms = Some(blocked_until);
             })
             .await;
@@ -580,23 +585,29 @@ fn derive_target_domain(
     package: &CertifiedSummaryPackage,
 ) -> anyhow::Result<(ialp_common_types::DomainId, u32)> {
     if package.inclusion_proofs.len() < 2 {
-        bail!("transport packages must carry at least one export proof");
+        bail!("transport packages must carry at least one non-summary inclusion proof");
     }
     let mut target_domain = None;
-    let mut export_count = 0u32;
+    let mut proof_count = 0u32;
+    let mut flow_kind = None;
     for (index, encoded) in package.inclusion_proofs.iter().enumerate() {
         let proof = InclusionProof::decode(&mut &encoded[..])
             .map_err(|error| anyhow!("failed to decode package inclusion proof: {error}"))?;
         match (index, proof) {
             (0, InclusionProof::SummaryHeaderStorageV1(_)) => {}
-            (0, InclusionProof::ExportV1(_)) => {
+            (0, InclusionProof::ExportV1(_) | InclusionProof::FinalizedImportV1(_)) => {
                 bail!("summary-header storage proof must remain at inclusion_proofs[0]")
             }
             (_, InclusionProof::SummaryHeaderStorageV1(_)) => {
                 bail!("summary-header storage proof may appear only at inclusion_proofs[0]")
             }
             (_, InclusionProof::ExportV1(proof)) => {
-                export_count = export_count.saturating_add(1);
+                proof_count = proof_count.saturating_add(1);
+                match flow_kind {
+                    Some("completion") => bail!("package mixes forward export proofs with completion proofs"),
+                    None => flow_kind = Some("forward"),
+                    _ => {}
+                }
                 match target_domain {
                     Some(existing) if existing != proof.leaf.target_domain => {
                         bail!("package export proofs contain mixed target domains")
@@ -610,11 +621,29 @@ fn derive_target_domain(
                     bail!("package export proofs do not match package source domain/epoch");
                 }
             }
+            (_, InclusionProof::FinalizedImportV1(proof)) => {
+                proof_count = proof_count.saturating_add(1);
+                match flow_kind {
+                    Some("forward") => bail!("package mixes completion proofs with forward export proofs"),
+                    None => flow_kind = Some("completion"),
+                    _ => {}
+                }
+                match target_domain {
+                    Some(existing) if existing != proof.leaf.source_domain => {
+                        bail!("package completion proofs contain mixed source domains")
+                    }
+                    None => target_domain = Some(proof.leaf.source_domain),
+                    _ => {}
+                }
+                if proof.leaf.target_domain != package.header.domain_id {
+                    bail!("package completion proofs do not match package source domain");
+                }
+            }
         }
     }
     match target_domain {
-        Some(target_domain) => Ok((target_domain, export_count)),
-        None => bail!("package does not contain any export proofs"),
+        Some(target_domain) => Ok((target_domain, proof_count)),
+        None => bail!("package does not contain any supported inclusion proofs"),
     }
 }
 

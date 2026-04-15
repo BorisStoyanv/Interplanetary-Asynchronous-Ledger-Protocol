@@ -3365,6 +3365,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "ialp-scenario-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "frame-support",
+ "frame-system",
+ "hex",
+ "ialp-common-config",
+ "ialp-common-types",
+ "ialp-runtime",
+ "ialp-summary-exporter",
+ "ialp-summary-importer",
+ "ialp-summary-relay",
+ "jsonrpsee",
+ "multiaddr 0.18.2",
+ "pallet-balances",
+ "pallet-ialp-transfers",
+ "pallet-transaction-payment",
+ "parity-scale-codec",
+ "serde",
+ "serde_json",
+ "sp-core",
+ "sp-runtime",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "ialp-summary-exporter"
 version = "0.1.0"
 dependencies = [

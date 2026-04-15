@@ -1,7 +1,7 @@
 mod cli;
 mod relay_client;
 mod rpc_client;
-mod store;
+pub mod store;
 
 use std::{
     collections::BTreeMap,
@@ -14,8 +14,9 @@ use clap::Parser;
 use codec::Encode;
 use ialp_common_config::{load_domain_config, load_transport_config};
 use ialp_common_types::{
-    build_export_inclusion_proof, export_merkle_root, sort_export_leaves, CertifiedSummaryPackage,
-    DomainId, ExportLeaf, RelayPackageEnvelopeV1, SummaryCertificate,
+    build_export_inclusion_proof, build_finalized_import_inclusion_proof, export_merkle_root,
+    import_merkle_root, sort_export_leaves, sort_finalized_import_leaves, CertifiedSummaryPackage,
+    DomainId, ExportLeaf, FinalizedImportLeaf, RelayPackageEnvelopeV1, SummaryCertificate,
     SummaryCertificationReadiness, SummaryCertificationState,
 };
 
@@ -24,8 +25,8 @@ use crate::{
     relay_client::{ensure_submission_succeeded, RelayHttpClient},
     rpc_client::{NodeRpcClient, StagedSummaryView},
     store::{
-        decode_export_proofs, decode_summary_header_storage_proof, PackageRecord,
-        RelaySubmissionState, Store,
+        decode_export_proofs, decode_finalized_import_proofs,
+        decode_summary_header_storage_proof, PackageRecord, RelaySubmissionState, Store,
     },
 };
 
@@ -131,7 +132,8 @@ fn show_package(args: cli::ShowArgs) -> anyhow::Result<()> {
             .first()
             .context("package is missing inclusion_proofs[0]")?,
     )?;
-    let export_proofs = decode_export_proofs(&package.inclusion_proofs[1..])?;
+    let export_proofs = decode_export_proofs(&package.inclusion_proofs[1..]).ok();
+    let finalized_import_proofs = decode_finalized_import_proofs(&package.inclusion_proofs[1..]).ok();
 
     let output = serde_json::json!({
         "manifest": manifest,
@@ -163,7 +165,16 @@ fn show_package(args: cli::ShowArgs) -> anyhow::Result<()> {
                     "proof_total_bytes": summary_proof.total_proof_bytes(),
                     "proof_block_header_len": summary_proof.proof_block_header.len(),
                 },
-                "export_v1": export_proofs.iter().map(|proof| serde_json::json!({
+                "export_v1": export_proofs.unwrap_or_default().iter().map(|proof| serde_json::json!({
+                    "export_id": hex_hash(proof.leaf.export_id),
+                    "source_domain": proof.leaf.source_domain,
+                    "target_domain": proof.leaf.target_domain,
+                    "amount": proof.leaf.amount,
+                    "leaf_index": proof.leaf_index,
+                    "leaf_count": proof.leaf_count,
+                    "sibling_count": proof.siblings.len(),
+                })).collect::<Vec<_>>(),
+                "finalized_import_v1": finalized_import_proofs.unwrap_or_default().iter().map(|proof| serde_json::json!({
                     "export_id": hex_hash(proof.leaf.export_id),
                     "source_domain": proof.leaf.source_domain,
                     "target_domain": proof.leaf.target_domain,
@@ -228,6 +239,29 @@ async fn sync_once(
 
         sort_export_leaves(&mut leaves);
         let grouped = group_exports_by_target(&leaves);
+        let mut finalized_imports = rpc
+            .epoch_finalized_imports(epoch_id)
+            .await?
+            .into_iter()
+            .filter_map(|record| record.finalized_leaf())
+            .collect::<Vec<_>>();
+        let expected_import_root = import_merkle_root(
+            staged.header.domain_id,
+            staged.header.epoch_id,
+            staged.header.start_block_height,
+            staged.header.end_block_height,
+            &finalized_imports,
+        );
+        if expected_import_root != staged.header.import_root {
+            bail!(
+                "epoch {} import_root mismatch: header={} exporter={}",
+                epoch_id,
+                hex_hash(staged.header.import_root),
+                hex_hash(expected_import_root),
+            );
+        }
+        sort_finalized_import_leaves(&mut finalized_imports);
+        let grouped_finalized_imports = group_finalized_imports_by_source(&finalized_imports);
         for (target_domain, target_leaves) in &grouped {
             let export_ids = target_leaves
                 .iter()
@@ -245,6 +279,25 @@ async fn sync_once(
                 readiness.staged_at_block_hash,
                 &export_ids,
                 pending_reason.clone(),
+            );
+        }
+        for (target_domain, target_leaves) in &grouped_finalized_imports {
+            let export_ids = target_leaves
+                .iter()
+                .map(|leaf| leaf.export_id)
+                .collect::<Vec<_>>();
+            let pending_reason = match &readiness.state {
+                SummaryCertificationState::Pending(reason) => Some(format!("{reason:?}")),
+                SummaryCertificationState::Ready(_) => None,
+            };
+            index.upsert_pending(
+                epoch_id,
+                *target_domain,
+                staged.header.summary_hash,
+                staged.staged_at_block_number,
+                readiness.staged_at_block_hash,
+                &export_ids,
+                pending_reason,
             );
         }
 
@@ -273,6 +326,34 @@ async fn sync_once(
                 );
                 if package.inclusion_proofs.is_empty() || !package.artifacts.is_empty() {
                     bail!("Phase 2B package builder emitted invalid proof/artifact layout");
+                }
+                store.persist_package(&mut index, target_domain, &export_ids, &package)?;
+            }
+            for (target_domain, target_leaves) in grouped_finalized_imports {
+                let export_ids = target_leaves
+                    .iter()
+                    .map(|leaf| leaf.export_id)
+                    .collect::<Vec<_>>();
+                let import_proofs = target_leaves
+                    .iter()
+                    .map(|leaf| {
+                        build_finalized_import_inclusion_proof(&finalized_imports, leaf.export_id)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing finalized-import proof for {} in epoch {}",
+                                    hex::encode(leaf.export_id),
+                                    epoch_id
+                                )
+                            })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let package = CertifiedSummaryPackage::from_bundle_with_finalized_import_proofs(
+                    staged.header.clone(),
+                    bundle.clone(),
+                    import_proofs,
+                );
+                if package.inclusion_proofs.is_empty() || !package.artifacts.is_empty() {
+                    bail!("Phase 4A completion package builder emitted invalid proof/artifact layout");
                 }
                 store.persist_package(&mut index, target_domain, &export_ids, &package)?;
             }
@@ -334,6 +415,19 @@ fn group_exports_by_target(leaves: &[ExportLeaf]) -> BTreeMap<DomainId, Vec<Expo
     for leaf in leaves {
         grouped
             .entry(leaf.target_domain)
+            .or_insert_with(Vec::new)
+            .push(leaf.clone());
+    }
+    grouped
+}
+
+fn group_finalized_imports_by_source(
+    leaves: &[FinalizedImportLeaf],
+) -> BTreeMap<DomainId, Vec<FinalizedImportLeaf>> {
+    let mut grouped = BTreeMap::new();
+    for leaf in leaves {
+        grouped
+            .entry(leaf.source_domain)
             .or_insert_with(Vec::new)
             .push(leaf.clone());
     }

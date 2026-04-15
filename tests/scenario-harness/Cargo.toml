@@ -1,0 +1,42 @@
+[package]
+name = "ialp-scenario-harness"
+description = "Phase 3B end-to-end scenario harness for automated multi-domain IALP flows."
+version = "0.1.0"
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+edition.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono = { workspace = true, features = ["clock", "serde", "std"] }
+clap.workspace = true
+codec.workspace = true
+frame-support = { workspace = true, features = ["std"] }
+frame-system = { workspace = true, features = ["std"] }
+hex.workspace = true
+ialp-common-config.workspace = true
+ialp-common-types = { workspace = true, features = ["serde", "std"] }
+ialp-runtime = { workspace = true, features = ["std"] }
+ialp-summary-exporter = { path = "../../services/exporter" }
+ialp-summary-importer = { path = "../../services/importer" }
+ialp-summary-relay = { path = "../../services/relay" }
+jsonrpsee.workspace = true
+multiaddr.workspace = true
+pallet-ialp-transfers = { workspace = true, features = ["std"] }
+pallet-balances = { workspace = true, features = ["std"] }
+pallet-transaction-payment = { workspace = true, features = ["std"] }
+serde.workspace = true
+serde_json = { workspace = true, features = ["std"] }
+sp-core = { workspace = true, features = ["std"] }
+sp-runtime = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "signal", "time"] }
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

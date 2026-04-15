@@ -11,7 +11,7 @@ use ialp_common_types::{
     fixed_bytes, ChainIdentity, DomainId, CHAIN_ID_BYTES, CHAIN_NAME_BYTES, TOKEN_SYMBOL_BYTES,
 };
 use multiaddr::{Multiaddr, Protocol};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const DEFAULT_CONFIG_ROOT: &str = "config/domains";
@@ -35,7 +35,7 @@ pub enum ConfigError {
     Validation(String),
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DomainChainType {
     Development,
@@ -54,13 +54,13 @@ impl fmt::Display for DomainChainType {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TokenConfig {
     pub symbol: String,
     pub decimals: u8,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct NetworkConfig {
     pub p2p_port: u16,
     pub rpc_port: u16,
@@ -69,12 +69,12 @@ pub struct NetworkConfig {
     pub bootnodes: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EpochConfig {
     pub length_seconds: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AuthorityConfig {
     pub name: String,
     pub account_seed: String,
@@ -82,14 +82,14 @@ pub struct AuthorityConfig {
     pub grandpa_seed: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct BootstrapConfig {
     pub sudo_account_seed: String,
     pub importer_account_seed: String,
     pub endowed_accounts: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DomainConfig {
     pub domain_id: DomainId,
     pub chain_name: String,
@@ -108,7 +108,7 @@ pub struct LoadedDomainConfig {
     pub config: DomainConfig,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RelayTransportConfig {
     pub listen_addr: String,
     pub store_dir: PathBuf,
@@ -116,18 +116,18 @@ pub struct RelayTransportConfig {
     pub ack_poll_millis: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ImporterTransportConfig {
     pub listen_addr: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct BlackoutWindowConfig {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LinkProfileConfig {
     pub source_domain: DomainId,
     pub target_domain: DomainId,
@@ -139,7 +139,7 @@ pub struct LinkProfileConfig {
     pub blackout_windows: Vec<BlackoutWindowConfig>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TransportConfig {
     pub relay: RelayTransportConfig,
     pub importers: BTreeMap<DomainId, ImporterTransportConfig>,

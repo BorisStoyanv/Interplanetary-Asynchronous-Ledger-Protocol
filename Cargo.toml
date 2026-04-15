@@ -17,6 +17,7 @@ members = [
     "services/exporter",
     "services/importer",
     "services/relay",
+    "tests/scenario-harness",
 ]
 resolver = "2"
 

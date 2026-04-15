@@ -1,8 +1,10 @@
 use anyhow::{anyhow, bail, Context};
 use codec::{Decode, Encode};
 use ialp_common_types::{
-    epoch_export_ids_storage_key, export_record_storage_key, summary_header_storage_key, EpochId,
-    EpochSummaryHeader, ExportId, ExportRecord, SummaryCertificationReadiness,
+    epoch_export_ids_storage_key, epoch_finalized_import_ids_storage_key,
+    export_record_storage_key, observed_import_storage_key, summary_header_storage_key, EpochId,
+    EpochSummaryHeader, ExportId, ExportRecord, ObservedImportRecord,
+    SummaryCertificationReadiness,
 };
 use jsonrpsee::{
     core::{
@@ -159,6 +161,40 @@ impl NodeRpcClient {
             exports.push(record);
         }
         Ok(exports)
+    }
+
+    pub async fn epoch_finalized_import_ids(
+        &self,
+        epoch_id: EpochId,
+    ) -> anyhow::Result<Vec<ExportId>> {
+        Ok(self
+            .load_storage_value::<Vec<ExportId>>(epoch_finalized_import_ids_storage_key(epoch_id))
+            .await?
+            .unwrap_or_default())
+    }
+
+    pub async fn observed_import(
+        &self,
+        export_id: ExportId,
+    ) -> anyhow::Result<Option<ObservedImportRecord>> {
+        self.load_storage_value::<ObservedImportRecord>(observed_import_storage_key(export_id))
+            .await
+    }
+
+    pub async fn epoch_finalized_imports(
+        &self,
+        epoch_id: EpochId,
+    ) -> anyhow::Result<Vec<ObservedImportRecord>> {
+        let export_ids = self.epoch_finalized_import_ids(epoch_id).await?;
+        let mut records = Vec::with_capacity(export_ids.len());
+        for export_id in export_ids {
+            let record = self
+                .observed_import(export_id)
+                .await?
+                .ok_or_else(|| anyhow!("missing observed import record 0x{}", hex::encode(export_id)))?;
+            records.push(record);
+        }
+        Ok(records)
     }
 
     async fn load_storage_value<T: Decode>(&self, key: Vec<u8>) -> anyhow::Result<Option<T>> {

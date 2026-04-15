@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context};
 use codec::Decode;
 use ialp_common_types::{
-    importer_account_storage_key, observed_import_storage_key, ExportId, ObservedImportRecord,
+    export_record_storage_key, importer_account_storage_key, observed_import_storage_key,
+    ExportId, ExportRecord, ObservedImportRecord,
 };
 use jsonrpsee::{
     core::{client::ClientT, rpc_params},
@@ -15,6 +16,7 @@ pub struct NodeRpcClient {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeVersionView {
     pub spec_version: u32,
     pub transaction_version: u32,
@@ -53,6 +55,11 @@ impl NodeRpcClient {
         export_id: ExportId,
     ) -> anyhow::Result<Option<ObservedImportRecord>> {
         self.load_storage_value(observed_import_storage_key(export_id))
+            .await
+    }
+
+    pub async fn export_record(&self, export_id: ExportId) -> anyhow::Result<Option<ExportRecord>> {
+        self.load_storage_value(export_record_storage_key(export_id))
             .await
     }
 

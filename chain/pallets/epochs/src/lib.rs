@@ -11,7 +11,7 @@ pub mod pallet {
         empty_commitment_root, event_envelope_hash, fold_epoch_accumulator, seed_epoch_accumulator,
         tx_envelope_hash, DomainId, EpochId, EpochSummaryHashInput, EpochSummaryHeader,
         StagedSummaryRecord, BLOCK_ROOT_LABEL, EMPTY_HASH, EPOCH_SUMMARY_VERSION, EVENT_ROOT_LABEL,
-        GOVERNANCE_ROOT_EMPTY_LABEL, IMPORT_ROOT_EMPTY_LABEL, TX_ROOT_LABEL,
+        GOVERNANCE_ROOT_EMPTY_LABEL, TX_ROOT_LABEL,
     };
     use scale_info::TypeInfo;
     use sp_runtime::{
@@ -27,6 +27,14 @@ pub mod pallet {
 
     pub trait ExportCommitmentProvider {
         fn commit_epoch_exports(
+            epoch_id: EpochId,
+            start_block_height: u32,
+            end_block_height: u32,
+        ) -> [u8; 32];
+    }
+
+    pub trait ImportCommitmentProvider {
+        fn commit_epoch_imports(
             epoch_id: EpochId,
             start_block_height: u32,
             end_block_height: u32,
@@ -81,6 +89,7 @@ pub mod pallet {
         type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
         type SummaryContext: SummaryContext<Self::Hash>;
         type ExportCommitmentProvider: ExportCommitmentProvider;
+        type ImportCommitmentProvider: ImportCommitmentProvider;
     }
 
     #[pallet::pallet]
@@ -258,6 +267,11 @@ pub mod pallet {
                 start_height,
                 end_height,
             );
+            let import_root = T::ImportCommitmentProvider::commit_epoch_imports(
+                epoch_id,
+                start_height,
+                end_height,
+            );
 
             SummarySlots::<T>::mutate(epoch_id, |maybe_slot| {
                 let Some(slot) = maybe_slot else {
@@ -280,13 +294,7 @@ pub mod pallet {
                     tx_root: slot.accumulators.tx_root,
                     event_root: slot.accumulators.event_root,
                     export_root,
-                    import_root: empty_commitment_root(
-                        IMPORT_ROOT_EMPTY_LABEL,
-                        domain_id,
-                        epoch_id,
-                        start_height,
-                        end_height,
-                    ),
+                    import_root,
                     governance_root: empty_commitment_root(
                         GOVERNANCE_ROOT_EMPTY_LABEL,
                         domain_id,
@@ -459,6 +467,7 @@ mod tests {
 
     pub struct TestSummaryContext;
     pub struct TestExportCommitmentProvider;
+    pub struct TestImportCommitmentProvider;
 
     impl SummaryContext<H256> for TestSummaryContext {
         fn domain_id() -> DomainId {
@@ -490,10 +499,27 @@ mod tests {
         }
     }
 
+    impl ImportCommitmentProvider for TestImportCommitmentProvider {
+        fn commit_epoch_imports(
+            epoch_id: EpochId,
+            start_block_height: u32,
+            end_block_height: u32,
+        ) -> [u8; 32] {
+            empty_commitment_root(
+                "IALP:import-root:test:v1",
+                DomainId::Earth,
+                epoch_id,
+                start_block_height,
+                end_block_height,
+            )
+        }
+    }
+
     impl Config for Test {
         type RuntimeEvent = RuntimeEvent;
         type SummaryContext = TestSummaryContext;
         type ExportCommitmentProvider = TestExportCommitmentProvider;
+        type ImportCommitmentProvider = TestImportCommitmentProvider;
     }
 
     fn new_test_ext() -> sp_io::TestExternalities {

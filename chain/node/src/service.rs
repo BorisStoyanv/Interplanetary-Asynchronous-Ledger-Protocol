@@ -24,7 +24,11 @@ pub(crate) type SharedAuthoritySet = sc_consensus_grandpa::SharedAuthoritySet<
     ialp_runtime::BlockNumber,
 >;
 
-const GRANDPA_JUSTIFICATION_PERIOD: u32 = 512;
+// IALP's proof-bearing export path needs GRANDPA justifications to appear within local epoch
+// windows, otherwise staged summaries can never become export-certified during scenario runs or
+// short-lived operator tests. Keeping this at 1 is acceptable for the current single-authority
+// local-domain environment and preserves deterministic certification timing.
+const GRANDPA_JUSTIFICATION_PERIOD: u32 = 1;
 
 pub type Service = sc_service::PartialComponents<
     FullClient,

@@ -102,6 +102,8 @@ pub enum DuplicateStatus {
 #[serde(rename_all = "snake_case")]
 pub enum SubmissionStatus {
     RemoteObserved,
+    RemoteFinalized,
+    SourceResolved,
     SkippedDuplicate,
     Rejected,
 }

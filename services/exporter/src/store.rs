@@ -6,8 +6,8 @@ use std::{
 use anyhow::{anyhow, bail, Context};
 use codec::{Decode, Encode};
 use ialp_common_types::{
-    CertifiedSummaryPackage, DomainId, EpochId, ExportId, ExportInclusionProof, InclusionProof,
-    SummaryCertificate, SummaryHeaderStorageProof,
+    CertifiedSummaryPackage, DomainId, EpochId, ExportId, ExportInclusionProof,
+    FinalizedImportInclusionProof, InclusionProof, SummaryCertificate, SummaryHeaderStorageProof,
 };
 use serde::{Deserialize, Serialize};
 
@@ -570,12 +570,7 @@ impl Store {
                 .first()
                 .ok_or_else(|| anyhow!("package is missing inclusion_proofs[0]"))?,
         )?;
-        let export_proofs = decode_export_proofs(&package.inclusion_proofs[1..])?;
-        let proof_kinds = {
-            let mut kinds = vec!["summary_header_storage_v1".to_string()];
-            kinds.extend(export_proofs.iter().map(|_| "export_v1".to_string()));
-            kinds
-        };
+        let proof_kinds = decode_proof_kinds(&package.inclusion_proofs[1..])?;
 
         Ok(PackageManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
@@ -673,7 +668,9 @@ pub fn decode_summary_header_storage_proof(
         .map_err(|error| anyhow!("failed to decode inclusion proof: {error}"))?
     {
         InclusionProof::SummaryHeaderStorageV1(proof) => Ok(proof),
-        InclusionProof::ExportV1(_) => bail!("expected summary-header storage proof at index 0"),
+        InclusionProof::ExportV1(_) | InclusionProof::FinalizedImportV1(_) => {
+            bail!("expected summary-header storage proof at index 0")
+        }
     }
 }
 
@@ -688,9 +685,50 @@ pub fn decode_export_proofs(bytes: &[Vec<u8>]) -> anyhow::Result<Vec<ExportInclu
                 InclusionProof::SummaryHeaderStorageV1(_) => {
                     bail!("summary-header storage proof is only valid at inclusion_proofs[0]")
                 }
+                InclusionProof::FinalizedImportV1(_) => {
+                    bail!("expected only export proofs after inclusion_proofs[0]")
+                }
             }
         })
         .collect()
+}
+
+pub fn decode_finalized_import_proofs(
+    bytes: &[Vec<u8>],
+) -> anyhow::Result<Vec<FinalizedImportInclusionProof>> {
+    bytes
+        .iter()
+        .map(|entry| {
+            match InclusionProof::decode(&mut &entry[..])
+                .map_err(|error| anyhow!("failed to decode inclusion proof: {error}"))?
+            {
+                InclusionProof::FinalizedImportV1(proof) => Ok(proof),
+                InclusionProof::SummaryHeaderStorageV1(_) => {
+                    bail!("summary-header storage proof is only valid at inclusion_proofs[0]")
+                }
+                InclusionProof::ExportV1(_) => {
+                    bail!("expected only finalized-import proofs after inclusion_proofs[0]")
+                }
+            }
+        })
+        .collect()
+}
+
+fn decode_proof_kinds(bytes: &[Vec<u8>]) -> anyhow::Result<Vec<String>> {
+    let mut kinds = vec!["summary_header_storage_v1".to_string()];
+    for entry in bytes {
+        let kind = match InclusionProof::decode(&mut &entry[..])
+            .map_err(|error| anyhow!("failed to decode inclusion proof: {error}"))?
+        {
+            InclusionProof::SummaryHeaderStorageV1(_) => {
+                bail!("summary-header storage proof is only valid at inclusion_proofs[0]")
+            }
+            InclusionProof::ExportV1(_) => "export_v1",
+            InclusionProof::FinalizedImportV1(_) => "finalized_import_v1",
+        };
+        kinds.push(kind.to_string());
+    }
+    Ok(kinds)
 }
 
 fn hex_hash(hash: [u8; 32]) -> String {

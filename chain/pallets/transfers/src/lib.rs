@@ -6,14 +6,19 @@ pub use pallet::*;
 pub mod pallet {
     use frame_support::{
         pallet_prelude::*,
-        traits::fungible::{InspectHold, MutateHold},
+        traits::{
+            fungible::{InspectHold, Mutate as MutateBalance, MutateHold},
+            tokens::{Fortitude, Precision},
+        },
     };
     use frame_system::pallet_prelude::*;
     use ialp_common_types::{
-        export_id, export_merkle_root, fixed_bytes, AccountIdBytes, DomainId, EpochId, ExportId,
-        ExportLeaf, ExportLeafHashInput, ExportRecord, ExportStatus, ImportObservationStatus,
-        ObservedImportClaim, ObservedImportRecord,
+        export_id, export_merkle_root, fixed_bytes, import_merkle_root, AccountIdBytes, DomainId,
+        EpochId, ExportId, ExportLeaf, ExportLeafHashInput, ExportRecord, ExportStatus,
+        FinalizedImportLeaf, ImportObservationStatus, ObservedImportClaim, ObservedImportRecord,
+        RemoteFinalizationClaim,
     };
+    use codec::Decode;
     use sp_runtime::traits::SaturatedConversion;
     use sp_std::vec::Vec;
 
@@ -29,6 +34,7 @@ pub mod pallet {
     pub trait Config: frame_system::Config {
         type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
         type Currency: InspectHold<Self::AccountId, Balance = u128, Reason = Self::RuntimeHoldReason>
+            + MutateBalance<Self::AccountId, Balance = u128>
             + MutateHold<Self::AccountId, Balance = u128, Reason = Self::RuntimeHoldReason>;
         type RuntimeHoldReason: From<HoldReason>;
         type DomainIdentity: DomainIdentityProvider;
@@ -68,6 +74,12 @@ pub mod pallet {
     #[pallet::unbounded]
     pub type ObservedImportsById<T> =
         StorageMap<_, Blake2_128Concat, ExportId, ObservedImportRecord, OptionQuery>;
+
+    #[pallet::storage]
+    #[pallet::getter(fn epoch_finalized_import_ids)]
+    #[pallet::unbounded]
+    pub type EpochFinalizedImportIds<T> =
+        StorageMap<_, Blake2_128Concat, EpochId, Vec<ExportId>, ValueQuery>;
 
     #[pallet::genesis_config]
     pub struct GenesisConfig<T: Config> {
@@ -111,6 +123,17 @@ pub mod pallet {
             source_domain: DomainId,
             target_domain: DomainId,
         },
+        ImportFinalized {
+            export_id: ExportId,
+            source_domain: DomainId,
+            target_domain: DomainId,
+            amount: u128,
+        },
+        RemoteFinalizationAcknowledged {
+            export_id: ExportId,
+            source_domain: DomainId,
+            target_domain: DomainId,
+        },
     }
 
     #[pallet::error]
@@ -122,6 +145,17 @@ pub mod pallet {
         UnauthorizedImporter,
         WrongTargetDomain,
         DuplicateObservedImport,
+        MissingObservedImport,
+        DuplicateFinalizedImport,
+        ImportNotObserved,
+        InvalidRecipientEncoding,
+        InvalidSenderEncoding,
+        MintFailed,
+        MissingExportRecord,
+        WrongSourceDomain,
+        WrongClaimTargetDomain,
+        CompletionMismatch,
+        HoldResolutionFailed,
     }
 
     #[pallet::call]
@@ -169,6 +203,10 @@ pub mod pallet {
                 ExportRecord {
                     leaf,
                     status: ExportStatus::LocalFinal,
+                    completion_summary_hash: None,
+                    completion_package_hash: None,
+                    resolved_at_source_block_height: None,
+                    resolver_account: None,
                 },
             );
             EpochExportIds::<T>::mutate(current_epoch, |export_ids: &mut Vec<ExportId>| {
@@ -206,23 +244,132 @@ pub mod pallet {
 
             let observed_at_local_block_height: u32 =
                 frame_system::Pallet::<T>::block_number().saturated_into();
-            let record = ObservedImportRecord {
-                version: claim.version,
-                export_id: claim.export_id,
-                source_domain: claim.source_domain,
-                target_domain: claim.target_domain,
-                source_epoch_id: claim.source_epoch_id,
-                summary_hash: claim.summary_hash,
-                package_hash: claim.package_hash,
-                recipient: claim.recipient,
-                amount: claim.amount,
+            let record = ObservedImportRecord::from_claim(
+                claim.clone(),
                 observed_at_local_block_height,
-                observer_account: Self::account_to_bytes(&who),
-                status: ImportObservationStatus::RemoteObserved,
-            };
+                Self::account_to_bytes(&who),
+            );
 
             ObservedImportsById::<T>::insert(claim.export_id, record);
             Self::deposit_event(Event::ImportObserved {
+                export_id: claim.export_id,
+                source_domain: claim.source_domain,
+                target_domain: claim.target_domain,
+            });
+            Ok(())
+        }
+
+        #[pallet::call_index(2)]
+        #[pallet::weight(10_000)]
+        pub fn finalize_verified_import(
+            origin: OriginFor<T>,
+            export_id: ExportId,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            let configured_importer =
+                ImporterAccount::<T>::get().ok_or(Error::<T>::MissingImporterAccount)?;
+            ensure!(who == configured_importer, Error::<T>::UnauthorizedImporter);
+
+            let mut record =
+                ObservedImportsById::<T>::get(export_id).ok_or(Error::<T>::MissingObservedImport)?;
+            ensure!(
+                record.target_domain == T::DomainIdentity::domain_id(),
+                Error::<T>::WrongTargetDomain
+            );
+            ensure!(
+                record.status == ImportObservationStatus::RemoteObserved,
+                Error::<T>::ImportNotObserved
+            );
+
+            let recipient =
+                Self::account_from_bytes(&record.recipient).ok_or(Error::<T>::InvalidRecipientEncoding)?;
+            T::Currency::mint_into(&recipient, record.amount).map_err(|_| Error::<T>::MintFailed)?;
+
+            let current_block_height: u32 =
+                frame_system::Pallet::<T>::block_number().saturated_into();
+            record.status = ImportObservationStatus::RemoteFinalized;
+            record.finalized_at_local_block_height = Some(current_block_height);
+            record.finalizer_account = Some(Self::account_to_bytes(&who));
+            ObservedImportsById::<T>::insert(export_id, &record);
+
+            let current_epoch = T::EpochInfo::current_epoch();
+            EpochFinalizedImportIds::<T>::mutate(current_epoch, |export_ids: &mut Vec<ExportId>| {
+                if !export_ids.contains(&export_id) {
+                    export_ids.push(export_id);
+                }
+            });
+
+            Self::deposit_event(Event::ImportFinalized {
+                export_id,
+                source_domain: record.source_domain,
+                target_domain: record.target_domain,
+                amount: record.amount,
+            });
+            Ok(())
+        }
+
+        #[pallet::call_index(3)]
+        #[pallet::weight(10_000)]
+        pub fn acknowledge_remote_finalization(
+            origin: OriginFor<T>,
+            claim: RemoteFinalizationClaim,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            let configured_importer =
+                ImporterAccount::<T>::get().ok_or(Error::<T>::MissingImporterAccount)?;
+            ensure!(who == configured_importer, Error::<T>::UnauthorizedImporter);
+            ensure!(
+                claim.source_domain == T::DomainIdentity::domain_id(),
+                Error::<T>::WrongSourceDomain
+            );
+
+            let current_block_height: u32 =
+                frame_system::Pallet::<T>::block_number().saturated_into();
+            ExportsById::<T>::try_mutate(claim.export_id, |maybe_record| -> DispatchResult {
+                let record = maybe_record.as_mut().ok_or(Error::<T>::MissingExportRecord)?;
+                ensure!(
+                    record.leaf.source_domain == claim.source_domain,
+                    Error::<T>::WrongSourceDomain
+                );
+                ensure!(
+                    record.leaf.target_domain == claim.target_domain,
+                    Error::<T>::WrongClaimTargetDomain
+                );
+                ensure!(
+                    record.leaf.source_epoch_id == claim.source_epoch_id
+                        && record.leaf.recipient == claim.recipient
+                        && record.leaf.amount == claim.amount,
+                    Error::<T>::CompletionMismatch
+                );
+                ensure!(
+                    record.status != ExportStatus::RemoteFinalized,
+                    Error::<T>::DuplicateFinalizedImport
+                );
+                ensure!(
+                    record.status == ExportStatus::Exported,
+                    Error::<T>::CompletionMismatch
+                );
+
+                let sender = Self::account_from_bytes(&record.leaf.sender)
+                    .ok_or(Error::<T>::InvalidSenderEncoding)?;
+                T::Currency::burn_held(
+                    &Self::hold_reason(),
+                    &sender,
+                    record.leaf.amount,
+                    Precision::Exact,
+                    Fortitude::Force,
+                )
+                .map_err(|_| Error::<T>::HoldResolutionFailed)?;
+
+                record.status = ExportStatus::RemoteFinalized;
+                record.completion_summary_hash = Some(claim.completion_summary_hash);
+                record.completion_package_hash = Some(claim.completion_package_hash);
+                record.resolved_at_source_block_height = Some(current_block_height);
+                record.resolver_account = Some(Self::account_to_bytes(&who));
+                Ok(())
+            })?;
+
+            Self::deposit_event(Event::RemoteFinalizationAcknowledged {
                 export_id: claim.export_id,
                 source_domain: claim.source_domain,
                 target_domain: claim.target_domain,
@@ -273,8 +420,33 @@ pub mod pallet {
             export_root
         }
 
+        pub fn canonical_epoch_finalized_imports(epoch_id: EpochId) -> Vec<FinalizedImportLeaf> {
+            let mut leaves = EpochFinalizedImportIds::<T>::get(epoch_id)
+                .into_iter()
+                .filter_map(|export_id| {
+                    ObservedImportsById::<T>::get(export_id).and_then(|record| record.finalized_leaf())
+                })
+                .collect::<Vec<_>>();
+            ialp_common_types::sort_finalized_import_leaves(&mut leaves);
+            leaves
+        }
+
+        pub fn commit_epoch_imports(
+            epoch_id: EpochId,
+            start_block_height: u32,
+            end_block_height: u32,
+        ) -> [u8; 32] {
+            let domain_id = T::DomainIdentity::domain_id();
+            let leaves = Self::canonical_epoch_finalized_imports(epoch_id);
+            import_merkle_root(domain_id, epoch_id, start_block_height, end_block_height, &leaves)
+        }
+
         pub fn account_to_bytes(account: &T::AccountId) -> AccountIdBytes {
             fixed_bytes(&account.encode())
+        }
+
+        fn account_from_bytes(bytes: &AccountIdBytes) -> Option<T::AccountId> {
+            T::AccountId::decode(&mut &bytes[..]).ok()
         }
 
         fn hold_reason() -> T::RuntimeHoldReason {
@@ -347,6 +519,7 @@ mod tests {
 
     pub struct TestSummaryContext;
     pub struct TestExportCommitmentProvider;
+    pub struct TestImportCommitmentProvider;
     pub struct TestDomainIdentity;
     pub struct TestEpochInfo;
 
@@ -374,6 +547,16 @@ mod tests {
         }
     }
 
+    impl pallet_ialp_epochs::ImportCommitmentProvider for TestImportCommitmentProvider {
+        fn commit_epoch_imports(
+            epoch_id: EpochId,
+            start_block_height: u32,
+            end_block_height: u32,
+        ) -> [u8; 32] {
+            Transfers::commit_epoch_imports(epoch_id, start_block_height, end_block_height)
+        }
+    }
+
     impl DomainIdentityProvider for TestDomainIdentity {
         fn domain_id() -> DomainId {
             Domain::domain_id()
@@ -390,6 +573,7 @@ mod tests {
         type RuntimeEvent = RuntimeEvent;
         type SummaryContext = TestSummaryContext;
         type ExportCommitmentProvider = TestExportCommitmentProvider;
+        type ImportCommitmentProvider = TestImportCommitmentProvider;
     }
 
     impl Config for Test {
