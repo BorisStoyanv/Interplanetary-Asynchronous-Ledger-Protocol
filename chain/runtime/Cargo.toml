@@ -24,6 +24,7 @@ pallet-balances = { workspace = true }
 pallet-grandpa = { workspace = true }
 pallet-ialp-domain = { workspace = true }
 pallet-ialp-epochs = { workspace = true }
+pallet-ialp-governance = { workspace = true }
 pallet-ialp-transfers = { workspace = true }
 pallet-sudo = { workspace = true }
 pallet-timestamp = { workspace = true }
@@ -62,6 +63,7 @@ std = [
 	"pallet-grandpa/std",
 	"pallet-ialp-domain/std",
 	"pallet-ialp-epochs/std",
+	"pallet-ialp-governance/std",
 	"pallet-ialp-transfers/std",
 	"pallet-sudo/std",
 	"pallet-timestamp/std",

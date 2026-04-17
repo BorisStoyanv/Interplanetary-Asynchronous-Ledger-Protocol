@@ -28,9 +28,11 @@ ialp-summary-importer = { path = "../../services/importer" }
 ialp-summary-relay = { path = "../../services/relay" }
 jsonrpsee.workspace = true
 multiaddr.workspace = true
+pallet-ialp-governance = { workspace = true, features = ["std"] }
 pallet-ialp-transfers = { workspace = true, features = ["std"] }
 pallet-balances = { workspace = true, features = ["std"] }
 pallet-transaction-payment = { workspace = true, features = ["std"] }
+reqwest.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["std"] }
 sp-core = { workspace = true, features = ["std"] }

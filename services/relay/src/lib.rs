@@ -595,7 +595,12 @@ fn derive_target_domain(
             .map_err(|error| anyhow!("failed to decode package inclusion proof: {error}"))?;
         match (index, proof) {
             (0, InclusionProof::SummaryHeaderStorageV1(_)) => {}
-            (0, InclusionProof::ExportV1(_) | InclusionProof::FinalizedImportV1(_)) => {
+            (
+                0,
+                InclusionProof::ExportV1(_)
+                | InclusionProof::FinalizedImportV1(_)
+                | InclusionProof::GovernanceV1(_),
+            ) => {
                 bail!("summary-header storage proof must remain at inclusion_proofs[0]")
             }
             (_, InclusionProof::SummaryHeaderStorageV1(_)) => {
@@ -603,11 +608,7 @@ fn derive_target_domain(
             }
             (_, InclusionProof::ExportV1(proof)) => {
                 proof_count = proof_count.saturating_add(1);
-                match flow_kind {
-                    Some("completion") => bail!("package mixes forward export proofs with completion proofs"),
-                    None => flow_kind = Some("forward"),
-                    _ => {}
-                }
+                flow_kind.get_or_insert("mixed");
                 match target_domain {
                     Some(existing) if existing != proof.leaf.target_domain => {
                         bail!("package export proofs contain mixed target domains")
@@ -623,11 +624,7 @@ fn derive_target_domain(
             }
             (_, InclusionProof::FinalizedImportV1(proof)) => {
                 proof_count = proof_count.saturating_add(1);
-                match flow_kind {
-                    Some("forward") => bail!("package mixes completion proofs with forward export proofs"),
-                    None => flow_kind = Some("completion"),
-                    _ => {}
-                }
+                flow_kind.get_or_insert("mixed");
                 match target_domain {
                     Some(existing) if existing != proof.leaf.source_domain => {
                         bail!("package completion proofs contain mixed source domains")
@@ -637,6 +634,31 @@ fn derive_target_domain(
                 }
                 if proof.leaf.target_domain != package.header.domain_id {
                     bail!("package completion proofs do not match package source domain");
+                }
+            }
+            (_, InclusionProof::GovernanceV1(proof)) => {
+                proof_count = proof_count.saturating_add(1);
+                flow_kind.get_or_insert("mixed");
+                match target_domain {
+                    Some(existing) if existing != proof.leaf.target_domain() => {
+                        bail!("package governance proofs contain mixed target domains")
+                    }
+                    None => target_domain = Some(proof.leaf.target_domain()),
+                    _ => {}
+                }
+                match &proof.leaf {
+                    ialp_common_types::GovernanceLeaf::ProposalV1(leaf) => {
+                        if leaf.source_domain != package.header.domain_id
+                            || leaf.approval_epoch != package.header.epoch_id
+                        {
+                            bail!("package governance proposal proofs do not match package source domain/epoch");
+                        }
+                    }
+                    ialp_common_types::GovernanceLeaf::AckV1(leaf) => {
+                        if leaf.acknowledged_epoch != package.header.epoch_id {
+                            bail!("package governance ack proofs do not match package source epoch");
+                        }
+                    }
                 }
             }
         }
@@ -758,9 +780,11 @@ mod tests {
     use super::*;
     use codec::Encode;
     use ialp_common_types::{
-        DomainId, EpochSummaryHeader, ExportInclusionProof, ExportLeaf, ExportLeafHashInput,
-        GrandpaFinalityCertificate, SummaryCertificate, SummaryCertificationBundle,
-        SummaryHeaderStorageProof, SUMMARY_HEADER_STORAGE_PROOF_VERSION,
+        build_governance_inclusion_proof, governance_proposal_id, DomainId, EpochSummaryHeader,
+        ExportInclusionProof, ExportLeaf, ExportLeafHashInput, GovernanceLeaf, GovernancePayload,
+        GovernanceProposalLeaf, GovernanceProposalLeafHashInput, GrandpaFinalityCertificate,
+        SummaryCertificate, SummaryCertificationBundle, SummaryHeaderStorageProof,
+        GOVERNANCE_PROPOSAL_LEAF_VERSION, SUMMARY_HEADER_STORAGE_PROOF_VERSION,
     };
 
     fn sample_package(target_domain: DomainId) -> CertifiedSummaryPackage {
@@ -892,5 +916,54 @@ mod tests {
 
         assert!(blocked > allowed.saturating_sub(1));
         assert_eq!(blocked, allowed);
+    }
+
+    #[test]
+    fn relay_accepts_governance_only_package_for_single_target_domain() {
+        let mut package = sample_package(DomainId::Moon);
+        let governance_leaf = GovernanceLeaf::ProposalV1(GovernanceProposalLeaf::from_hash_input(
+            GovernanceProposalLeafHashInput {
+                version: GOVERNANCE_PROPOSAL_LEAF_VERSION,
+                proposal_id: governance_proposal_id(DomainId::Earth, 0),
+                source_domain: DomainId::Earth,
+                target_domain: DomainId::Moon,
+                target_domains: vec![DomainId::Moon],
+                proposer: [3u8; 32],
+                payload_hash: GovernancePayload::SetProtocolVersion { new_version: 2 }
+                    .payload_hash(),
+                new_protocol_version: 2,
+                created_epoch: 4,
+                voting_start_epoch: 4,
+                voting_end_epoch: 5,
+                approval_epoch: 4,
+                activation_epoch: 9,
+            },
+        ));
+        package.inclusion_proofs = vec![
+            package.inclusion_proofs[0].clone(),
+            ialp_common_types::InclusionProof::GovernanceV1(
+                build_governance_inclusion_proof(
+                    core::slice::from_ref(&governance_leaf),
+                    governance_leaf.leaf_hash(),
+                )
+                .expect("proof"),
+            )
+            .encode(),
+        ];
+        package.package_hash = package.compute_package_hash();
+        let envelope = RelayPackageEnvelopeV1::new(
+            DomainId::Earth,
+            DomainId::Moon,
+            4,
+            package.header.summary_hash,
+            package.package_hash,
+            package.encode(),
+            1,
+            100,
+        );
+
+        let (_, decoded_package) =
+            decode_and_validate_envelope(&envelope.encode()).expect("governance envelope");
+        assert_eq!(decoded_package.header.domain_id, DomainId::Earth);
     }
 }

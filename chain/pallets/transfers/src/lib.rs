@@ -520,6 +520,7 @@ mod tests {
     pub struct TestSummaryContext;
     pub struct TestExportCommitmentProvider;
     pub struct TestImportCommitmentProvider;
+    pub struct TestGovernanceCommitmentProvider;
     pub struct TestDomainIdentity;
     pub struct TestEpochInfo;
 
@@ -557,6 +558,21 @@ mod tests {
         }
     }
 
+    impl pallet_ialp_epochs::GovernanceCommitmentProvider for TestGovernanceCommitmentProvider {
+        fn commit_epoch_governance(
+            epoch_id: EpochId,
+            start_block_height: u32,
+            end_block_height: u32,
+        ) -> [u8; 32] {
+            ialp_common_types::governance_merkle_empty_root(
+                Domain::domain_id(),
+                epoch_id,
+                start_block_height,
+                end_block_height,
+            )
+        }
+    }
+
     impl DomainIdentityProvider for TestDomainIdentity {
         fn domain_id() -> DomainId {
             Domain::domain_id()
@@ -574,6 +590,7 @@ mod tests {
         type SummaryContext = TestSummaryContext;
         type ExportCommitmentProvider = TestExportCommitmentProvider;
         type ImportCommitmentProvider = TestImportCommitmentProvider;
+        type GovernanceCommitmentProvider = TestGovernanceCommitmentProvider;
     }
 
     impl Config for Test {

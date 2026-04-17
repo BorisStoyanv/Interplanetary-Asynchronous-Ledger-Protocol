@@ -1,8 +1,12 @@
 use anyhow::{anyhow, Context};
 use codec::Decode;
 use ialp_common_types::{
-    export_record_storage_key, importer_account_storage_key, observed_import_storage_key,
-    ExportId, ExportRecord, ObservedImportRecord,
+    export_record_storage_key, governance_ack_record_storage_key,
+    governance_activation_record_storage_key, governance_importer_account_storage_key,
+    governance_proposal_storage_key, governance_protocol_version_storage_key,
+    importer_account_storage_key, observed_import_storage_key, ExportId, ExportRecord,
+    GovernanceAckRecord, GovernanceActivationRecord, GovernanceProposal, GovernanceProposalId,
+    ObservedImportRecord,
 };
 use jsonrpsee::{
     core::{client::ClientT, rpc_params},
@@ -50,6 +54,13 @@ impl NodeRpcClient {
             .await
     }
 
+    pub async fn governance_importer_account(
+        &self,
+    ) -> anyhow::Result<Option<ialp_runtime::AccountId>> {
+        self.load_storage_value(governance_importer_account_storage_key())
+            .await
+    }
+
     pub async fn observed_import(
         &self,
         export_id: ExportId,
@@ -61,6 +72,39 @@ impl NodeRpcClient {
     pub async fn export_record(&self, export_id: ExportId) -> anyhow::Result<Option<ExportRecord>> {
         self.load_storage_value(export_record_storage_key(export_id))
             .await
+    }
+
+    pub async fn governance_protocol_version(&self) -> anyhow::Result<Option<u32>> {
+        self.load_storage_value(governance_protocol_version_storage_key())
+            .await
+    }
+
+    pub async fn governance_proposal(
+        &self,
+        proposal_id: GovernanceProposalId,
+    ) -> anyhow::Result<Option<GovernanceProposal>> {
+        self.load_storage_value(governance_proposal_storage_key(proposal_id))
+            .await
+    }
+
+    pub async fn governance_activation_record(
+        &self,
+        proposal_id: GovernanceProposalId,
+    ) -> anyhow::Result<Option<GovernanceActivationRecord>> {
+        self.load_storage_value(governance_activation_record_storage_key(proposal_id))
+            .await
+    }
+
+    pub async fn governance_ack_record(
+        &self,
+        proposal_id: GovernanceProposalId,
+        acknowledging_domain: ialp_common_types::DomainId,
+    ) -> anyhow::Result<Option<GovernanceAckRecord>> {
+        self.load_storage_value(governance_ack_record_storage_key(
+            proposal_id,
+            acknowledging_domain,
+        ))
+        .await
     }
 
     pub async fn account_next_index(

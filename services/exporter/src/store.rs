@@ -7,7 +7,8 @@ use anyhow::{anyhow, bail, Context};
 use codec::{Decode, Encode};
 use ialp_common_types::{
     CertifiedSummaryPackage, DomainId, EpochId, ExportId, ExportInclusionProof,
-    FinalizedImportInclusionProof, InclusionProof, SummaryCertificate, SummaryHeaderStorageProof,
+    FinalizedImportInclusionProof, GovernanceInclusionProof, InclusionProof, SummaryCertificate,
+    SummaryHeaderStorageProof,
 };
 use serde::{Deserialize, Serialize};
 
@@ -668,7 +669,9 @@ pub fn decode_summary_header_storage_proof(
         .map_err(|error| anyhow!("failed to decode inclusion proof: {error}"))?
     {
         InclusionProof::SummaryHeaderStorageV1(proof) => Ok(proof),
-        InclusionProof::ExportV1(_) | InclusionProof::FinalizedImportV1(_) => {
+        InclusionProof::ExportV1(_)
+        | InclusionProof::FinalizedImportV1(_)
+        | InclusionProof::GovernanceV1(_) => {
             bail!("expected summary-header storage proof at index 0")
         }
     }
@@ -686,6 +689,9 @@ pub fn decode_export_proofs(bytes: &[Vec<u8>]) -> anyhow::Result<Vec<ExportInclu
                     bail!("summary-header storage proof is only valid at inclusion_proofs[0]")
                 }
                 InclusionProof::FinalizedImportV1(_) => {
+                    bail!("expected only export proofs after inclusion_proofs[0]")
+                }
+                InclusionProof::GovernanceV1(_) => {
                     bail!("expected only export proofs after inclusion_proofs[0]")
                 }
             }
@@ -709,6 +715,31 @@ pub fn decode_finalized_import_proofs(
                 InclusionProof::ExportV1(_) => {
                     bail!("expected only finalized-import proofs after inclusion_proofs[0]")
                 }
+                InclusionProof::GovernanceV1(_) => {
+                    bail!("expected only finalized-import proofs after inclusion_proofs[0]")
+                }
+            }
+        })
+        .collect()
+}
+
+pub fn decode_governance_proofs(bytes: &[Vec<u8>]) -> anyhow::Result<Vec<GovernanceInclusionProof>> {
+    bytes
+        .iter()
+        .map(|entry| {
+            match InclusionProof::decode(&mut &entry[..])
+                .map_err(|error| anyhow!("failed to decode inclusion proof: {error}"))?
+            {
+                InclusionProof::GovernanceV1(proof) => Ok(proof),
+                InclusionProof::SummaryHeaderStorageV1(_) => {
+                    bail!("summary-header storage proof is only valid at inclusion_proofs[0]")
+                }
+                InclusionProof::ExportV1(_) => {
+                    bail!("expected only governance proofs after inclusion_proofs[0]")
+                }
+                InclusionProof::FinalizedImportV1(_) => {
+                    bail!("expected only governance proofs after inclusion_proofs[0]")
+                }
             }
         })
         .collect()
@@ -725,6 +756,7 @@ fn decode_proof_kinds(bytes: &[Vec<u8>]) -> anyhow::Result<Vec<String>> {
             }
             InclusionProof::ExportV1(_) => "export_v1",
             InclusionProof::FinalizedImportV1(_) => "finalized_import_v1",
+            InclusionProof::GovernanceV1(_) => "governance_v1",
         };
         kinds.push(kind.to_string());
     }
@@ -743,9 +775,11 @@ fn hex_bytes(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use ialp_common_types::{
-        DomainId, EpochSummaryHeader, GrandpaFinalityCertificate, SummaryCertificate,
-        SummaryCertificationBundle, SummaryHeaderStorageProof, EXPORT_INCLUSION_PROOF_VERSION,
-        SUMMARY_HEADER_STORAGE_PROOF_VERSION,
+        build_governance_inclusion_proof, governance_proposal_id, DomainId, EpochSummaryHeader,
+        GovernanceLeaf, GovernancePayload, GovernanceProposalLeaf, GovernanceProposalLeafHashInput,
+        GrandpaFinalityCertificate, SummaryCertificate, SummaryCertificationBundle,
+        SummaryHeaderStorageProof, EXPORT_INCLUSION_PROOF_VERSION,
+        GOVERNANCE_PROPOSAL_LEAF_VERSION, SUMMARY_HEADER_STORAGE_PROOF_VERSION,
     };
 
     fn sample_header() -> EpochSummaryHeader {
@@ -814,6 +848,53 @@ mod tests {
         )
     }
 
+    fn sample_governance_package() -> CertifiedSummaryPackage {
+        let bundle = SummaryCertificationBundle {
+            certificate: SummaryCertificate::GrandpaV1(GrandpaFinalityCertificate {
+                version: 1,
+                grandpa_set_id: 0,
+                target_block_number: 13,
+                target_block_hash: [11u8; 32],
+                proof_block_number: 14,
+                proof_block_hash: [12u8; 32],
+                justification: vec![1, 2, 3],
+                ancestry_headers: vec![vec![4, 5]],
+            }),
+            summary_header_storage_proof: SummaryHeaderStorageProof {
+                version: SUMMARY_HEADER_STORAGE_PROOF_VERSION,
+                proof_block_number: 14,
+                proof_block_hash: [12u8; 32],
+                proof_block_header: vec![9, 9],
+                storage_key: vec![1, 2, 3],
+                trie_nodes: vec![vec![4, 5, 6]],
+            },
+        };
+        let leaf = GovernanceLeaf::ProposalV1(GovernanceProposalLeaf::from_hash_input(
+            GovernanceProposalLeafHashInput {
+                version: GOVERNANCE_PROPOSAL_LEAF_VERSION,
+                proposal_id: governance_proposal_id(DomainId::Earth, 0),
+                source_domain: DomainId::Earth,
+                target_domain: DomainId::Moon,
+                target_domains: vec![DomainId::Moon],
+                proposer: [21u8; 32],
+                payload_hash: GovernancePayload::SetProtocolVersion { new_version: 2 }
+                    .payload_hash(),
+                new_protocol_version: 2,
+                created_epoch: 2,
+                voting_start_epoch: 2,
+                voting_end_epoch: 3,
+                approval_epoch: 3,
+                activation_epoch: 7,
+            },
+        ));
+        CertifiedSummaryPackage::from_bundle_with_governance_proofs(
+            sample_header(),
+            bundle,
+            vec![build_governance_inclusion_proof(core::slice::from_ref(&leaf), leaf.leaf_hash())
+                .expect("proof")],
+        )
+    }
+
     #[test]
     fn decode_helpers_split_summary_and_export_proofs() {
         let package = sample_package();
@@ -863,5 +944,15 @@ mod tests {
             .display()
             .to_string()
             .contains("epoch-7-to-moon.scale"));
+    }
+
+    #[test]
+    fn governance_decode_helper_extracts_governance_proofs() {
+        let package = sample_governance_package();
+        let proofs =
+            decode_governance_proofs(&package.inclusion_proofs[1..]).expect("governance proofs");
+
+        assert_eq!(proofs.len(), 1);
+        assert!(matches!(proofs[0].leaf, GovernanceLeaf::ProposalV1(_)));
     }
 }

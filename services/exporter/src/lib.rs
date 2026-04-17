@@ -14,10 +14,12 @@ use clap::Parser;
 use codec::Encode;
 use ialp_common_config::{load_domain_config, load_transport_config};
 use ialp_common_types::{
-    build_export_inclusion_proof, build_finalized_import_inclusion_proof, export_merkle_root,
-    import_merkle_root, sort_export_leaves, sort_finalized_import_leaves, CertifiedSummaryPackage,
-    DomainId, ExportLeaf, FinalizedImportLeaf, RelayPackageEnvelopeV1, SummaryCertificate,
-    SummaryCertificationReadiness, SummaryCertificationState,
+    build_export_inclusion_proof, build_finalized_import_inclusion_proof,
+    build_governance_inclusion_proof, export_merkle_root, governance_merkle_root,
+    import_merkle_root, sort_export_leaves, sort_finalized_import_leaves, sort_governance_leaves,
+    CertifiedSummaryPackage, DomainId, ExportId, ExportLeaf, FinalizedImportLeaf, GovernanceLeaf,
+    RelayPackageEnvelopeV1, SummaryCertificate, SummaryCertificationReadiness,
+    SummaryCertificationState,
 };
 
 use crate::{
@@ -25,10 +27,17 @@ use crate::{
     relay_client::{ensure_submission_succeeded, RelayHttpClient},
     rpc_client::{NodeRpcClient, StagedSummaryView},
     store::{
-        decode_export_proofs, decode_finalized_import_proofs,
+        decode_export_proofs, decode_finalized_import_proofs, decode_governance_proofs,
         decode_summary_header_storage_proof, PackageRecord, RelaySubmissionState, Store,
     },
 };
+
+#[derive(Default)]
+struct TargetPackageInputs {
+    export_leaves: Vec<ExportLeaf>,
+    finalized_import_leaves: Vec<FinalizedImportLeaf>,
+    governance_leaves: Vec<GovernanceLeaf>,
+}
 
 pub async fn run_cli() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -134,6 +143,7 @@ fn show_package(args: cli::ShowArgs) -> anyhow::Result<()> {
     )?;
     let export_proofs = decode_export_proofs(&package.inclusion_proofs[1..]).ok();
     let finalized_import_proofs = decode_finalized_import_proofs(&package.inclusion_proofs[1..]).ok();
+    let governance_proofs = decode_governance_proofs(&package.inclusion_proofs[1..]).ok();
 
     let output = serde_json::json!({
         "manifest": manifest,
@@ -183,6 +193,35 @@ fn show_package(args: cli::ShowArgs) -> anyhow::Result<()> {
                     "leaf_count": proof.leaf_count,
                     "sibling_count": proof.siblings.len(),
                 })).collect::<Vec<_>>(),
+                "governance_v1": governance_proofs.unwrap_or_default().iter().map(|proof| match &proof.leaf {
+                    GovernanceLeaf::ProposalV1(leaf) => serde_json::json!({
+                        "kind": "proposal",
+                        "proposal_id": hex_hash(leaf.proposal_id),
+                        "source_domain": leaf.source_domain,
+                        "target_domain": leaf.target_domain,
+                        "target_domains": leaf.target_domains,
+                        "new_protocol_version": leaf.new_protocol_version,
+                        "approval_epoch": leaf.approval_epoch,
+                        "activation_epoch": leaf.activation_epoch,
+                        "leaf_index": proof.leaf_index,
+                        "leaf_count": proof.leaf_count,
+                        "sibling_count": proof.siblings.len(),
+                    }),
+                    GovernanceLeaf::AckV1(leaf) => serde_json::json!({
+                        "kind": "ack",
+                        "proposal_id": hex_hash(leaf.proposal_id),
+                        "source_domain": leaf.source_domain,
+                        "target_domain": leaf.target_domain,
+                        "acknowledging_domain": leaf.acknowledging_domain,
+                        "target_domains": leaf.target_domains,
+                        "new_protocol_version": leaf.new_protocol_version,
+                        "activation_epoch": leaf.activation_epoch,
+                        "acknowledged_epoch": leaf.acknowledged_epoch,
+                        "leaf_index": proof.leaf_index,
+                        "leaf_count": proof.leaf_count,
+                        "sibling_count": proof.siblings.len(),
+                    }),
+                }).collect::<Vec<_>>(),
             },
             "artifacts": {
                 "count": package.artifacts.len(),
@@ -262,15 +301,32 @@ async fn sync_once(
         }
         sort_finalized_import_leaves(&mut finalized_imports);
         let grouped_finalized_imports = group_finalized_imports_by_source(&finalized_imports);
-        for (target_domain, target_leaves) in &grouped {
-            let export_ids = target_leaves
-                .iter()
-                .map(|leaf| leaf.export_id)
-                .collect::<Vec<_>>();
-            let pending_reason = match &readiness.state {
-                SummaryCertificationState::Pending(reason) => Some(format!("{reason:?}")),
-                SummaryCertificationState::Ready(_) => None,
-            };
+        let mut governance_leaves = rpc.epoch_governance_leaves(epoch_id).await?;
+        let expected_governance_root = governance_merkle_root(
+            staged.header.domain_id,
+            staged.header.epoch_id,
+            staged.header.start_block_height,
+            staged.header.end_block_height,
+            &governance_leaves,
+        );
+        if expected_governance_root != staged.header.governance_root {
+            bail!(
+                "epoch {} governance_root mismatch: header={} exporter={}",
+                epoch_id,
+                hex_hash(staged.header.governance_root),
+                hex_hash(expected_governance_root),
+            );
+        }
+        sort_governance_leaves(&mut governance_leaves);
+        let grouped_governance = group_governance_by_target(&governance_leaves);
+        let grouped_targets =
+            combine_target_inputs(&grouped, &grouped_finalized_imports, &grouped_governance);
+        let pending_reason = match &readiness.state {
+            SummaryCertificationState::Pending(reason) => Some(format!("{reason:?}")),
+            SummaryCertificationState::Ready(_) => None,
+        };
+        for (target_domain, target_inputs) in &grouped_targets {
+            let export_ids = collect_target_export_ids(target_inputs);
             index.upsert_pending(
                 epoch_id,
                 *target_domain,
@@ -281,33 +337,12 @@ async fn sync_once(
                 pending_reason.clone(),
             );
         }
-        for (target_domain, target_leaves) in &grouped_finalized_imports {
-            let export_ids = target_leaves
-                .iter()
-                .map(|leaf| leaf.export_id)
-                .collect::<Vec<_>>();
-            let pending_reason = match &readiness.state {
-                SummaryCertificationState::Pending(reason) => Some(format!("{reason:?}")),
-                SummaryCertificationState::Ready(_) => None,
-            };
-            index.upsert_pending(
-                epoch_id,
-                *target_domain,
-                staged.header.summary_hash,
-                staged.staged_at_block_number,
-                readiness.staged_at_block_hash,
-                &export_ids,
-                pending_reason,
-            );
-        }
 
         if let SummaryCertificationState::Ready(bundle) = readiness.state {
-            for (target_domain, target_leaves) in grouped {
-                let export_ids = target_leaves
-                    .iter()
-                    .map(|leaf| leaf.export_id)
-                    .collect::<Vec<_>>();
-                let export_proofs = target_leaves
+            for (target_domain, target_inputs) in grouped_targets {
+                let export_ids = collect_target_export_ids(&target_inputs);
+                let export_proofs = target_inputs
+                    .export_leaves
                     .iter()
                     .map(|leaf| {
                         build_export_inclusion_proof(&leaves, leaf.export_id).ok_or_else(|| {
@@ -319,22 +354,8 @@ async fn sync_once(
                         })
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
-                let package = CertifiedSummaryPackage::from_bundle_with_export_proofs(
-                    staged.header.clone(),
-                    bundle.clone(),
-                    export_proofs,
-                );
-                if package.inclusion_proofs.is_empty() || !package.artifacts.is_empty() {
-                    bail!("Phase 2B package builder emitted invalid proof/artifact layout");
-                }
-                store.persist_package(&mut index, target_domain, &export_ids, &package)?;
-            }
-            for (target_domain, target_leaves) in grouped_finalized_imports {
-                let export_ids = target_leaves
-                    .iter()
-                    .map(|leaf| leaf.export_id)
-                    .collect::<Vec<_>>();
-                let import_proofs = target_leaves
+                let import_proofs = target_inputs
+                    .finalized_import_leaves
                     .iter()
                     .map(|leaf| {
                         build_finalized_import_inclusion_proof(&finalized_imports, leaf.export_id)
@@ -347,13 +368,29 @@ async fn sync_once(
                             })
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
-                let package = CertifiedSummaryPackage::from_bundle_with_finalized_import_proofs(
+                let governance_proofs = target_inputs
+                    .governance_leaves
+                    .iter()
+                    .map(|leaf| {
+                        build_governance_inclusion_proof(&governance_leaves, leaf.leaf_hash())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing governance proof for {} in epoch {}",
+                                    hex::encode(leaf.leaf_hash()),
+                                    epoch_id
+                                )
+                            })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let package = CertifiedSummaryPackage::from_bundle_with_mixed_proofs(
                     staged.header.clone(),
                     bundle.clone(),
+                    export_proofs,
                     import_proofs,
+                    governance_proofs,
                 );
                 if package.inclusion_proofs.is_empty() || !package.artifacts.is_empty() {
-                    bail!("Phase 4A completion package builder emitted invalid proof/artifact layout");
+                    bail!("mixed certified package builder emitted invalid proof/artifact layout");
                 }
                 store.persist_package(&mut index, target_domain, &export_ids, &package)?;
             }
@@ -377,8 +414,8 @@ async fn submit_certified_packages_to_relay(
     }) {
         let now = unix_now_millis()?;
         let (_, package) = store.load_package(record.epoch_id, record.target_domain)?;
-        let export_count = u32::try_from(record.export_count)
-            .context("export_count does not fit into u32 for relay envelope")?;
+        let proof_item_count = u32::try_from(package.inclusion_proofs.len().saturating_sub(1))
+            .context("package proof count does not fit into u32 for relay envelope")?;
         let envelope = RelayPackageEnvelopeV1::new(
             package.header.domain_id,
             record.target_domain,
@@ -386,7 +423,7 @@ async fn submit_certified_packages_to_relay(
             package.header.summary_hash,
             package.package_hash,
             package.encode(),
-            export_count,
+            proof_item_count,
             now,
         );
 
@@ -432,6 +469,61 @@ fn group_finalized_imports_by_source(
             .push(leaf.clone());
     }
     grouped
+}
+
+fn group_governance_by_target(leaves: &[GovernanceLeaf]) -> BTreeMap<DomainId, Vec<GovernanceLeaf>> {
+    let mut grouped = BTreeMap::new();
+    for leaf in leaves {
+        grouped
+            .entry(leaf.target_domain())
+            .or_insert_with(Vec::new)
+            .push(leaf.clone());
+    }
+    grouped
+}
+
+fn combine_target_inputs(
+    exports: &BTreeMap<DomainId, Vec<ExportLeaf>>,
+    finalized_imports: &BTreeMap<DomainId, Vec<FinalizedImportLeaf>>,
+    governance: &BTreeMap<DomainId, Vec<GovernanceLeaf>>,
+) -> BTreeMap<DomainId, TargetPackageInputs> {
+    let mut grouped = BTreeMap::new();
+    for (target_domain, leaves) in exports {
+        grouped
+            .entry(*target_domain)
+            .or_insert_with(TargetPackageInputs::default)
+            .export_leaves = leaves.clone();
+    }
+    for (target_domain, leaves) in finalized_imports {
+        grouped
+            .entry(*target_domain)
+            .or_insert_with(TargetPackageInputs::default)
+            .finalized_import_leaves = leaves.clone();
+    }
+    for (target_domain, leaves) in governance {
+        grouped
+            .entry(*target_domain)
+            .or_insert_with(TargetPackageInputs::default)
+            .governance_leaves = leaves.clone();
+    }
+    grouped
+}
+
+fn collect_target_export_ids(inputs: &TargetPackageInputs) -> Vec<ExportId> {
+    let mut export_ids = inputs
+        .export_leaves
+        .iter()
+        .map(|leaf| leaf.export_id)
+        .chain(
+            inputs
+                .finalized_import_leaves
+                .iter()
+                .map(|leaf| leaf.export_id),
+        )
+        .collect::<Vec<_>>();
+    export_ids.sort();
+    export_ids.dedup();
+    export_ids
 }
 
 fn readiness_json(readiness: &SummaryCertificationReadiness) -> serde_json::Value {

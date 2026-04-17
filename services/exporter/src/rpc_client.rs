@@ -2,9 +2,9 @@ use anyhow::{anyhow, bail, Context};
 use codec::{Decode, Encode};
 use ialp_common_types::{
     epoch_export_ids_storage_key, epoch_finalized_import_ids_storage_key,
-    export_record_storage_key, observed_import_storage_key, summary_header_storage_key, EpochId,
-    EpochSummaryHeader, ExportId, ExportRecord, ObservedImportRecord,
-    SummaryCertificationReadiness,
+    epoch_governance_leaf_ids_storage_key, export_record_storage_key, governance_leaf_storage_key,
+    observed_import_storage_key, summary_header_storage_key, EpochId, EpochSummaryHeader, ExportId,
+    ExportRecord, GovernanceLeaf, ObservedImportRecord, SummaryCertificationReadiness,
 };
 use jsonrpsee::{
     core::{
@@ -197,6 +197,39 @@ impl NodeRpcClient {
         Ok(records)
     }
 
+    pub async fn epoch_governance_leaf_ids(
+        &self,
+        epoch_id: EpochId,
+    ) -> anyhow::Result<Vec<[u8; 32]>> {
+        Ok(self
+            .load_storage_value::<Vec<[u8; 32]>>(epoch_governance_leaf_ids_storage_key(epoch_id))
+            .await?
+            .unwrap_or_default())
+    }
+
+    pub async fn governance_leaf(
+        &self,
+        leaf_hash: [u8; 32],
+    ) -> anyhow::Result<Option<GovernanceLeaf>> {
+        self.load_storage_value::<GovernanceLeaf>(governance_leaf_storage_key(leaf_hash))
+            .await
+    }
+
+    pub async fn epoch_governance_leaves(
+        &self,
+        epoch_id: EpochId,
+    ) -> anyhow::Result<Vec<GovernanceLeaf>> {
+        let leaf_ids = self.epoch_governance_leaf_ids(epoch_id).await?;
+        let mut leaves = Vec::with_capacity(leaf_ids.len());
+        for leaf_id in leaf_ids {
+            let leaf = self.governance_leaf(leaf_id).await?.ok_or_else(|| {
+                anyhow!("missing governance leaf record 0x{}", hex::encode(leaf_id))
+            })?;
+            leaves.push(leaf);
+        }
+        Ok(leaves)
+    }
+
     async fn load_storage_value<T: Decode>(&self, key: Vec<u8>) -> anyhow::Result<Option<T>> {
         let hex_key = format!("0x{}", hex::encode(key));
         let response: Option<String> = self
@@ -239,7 +272,9 @@ fn decode_hex_bytes(value: &str) -> anyhow::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ialp_common_types::{observed_import_storage_key, DomainId};
+    use ialp_common_types::{
+        governance_leaf_storage_key, observed_import_storage_key, DomainId,
+    };
 
     #[test]
     fn transfer_storage_keys_are_distinct() {
@@ -251,6 +286,10 @@ mod tests {
         assert_ne!(
             export_record_storage_key(export_id),
             observed_import_storage_key(export_id)
+        );
+        assert_ne!(
+            observed_import_storage_key(export_id),
+            governance_leaf_storage_key([8u8; 32])
         );
     }
 

@@ -112,6 +112,10 @@ fn genesis_patch(loaded: &LoadedDomainConfig) -> Result<Value, String> {
     {
         endowed_accounts.push((importer_account.clone(), 1u128 << 60));
     }
+    let governance_voters = endowed_accounts
+        .iter()
+        .map(|(account, _)| account.clone())
+        .collect::<Vec<_>>();
 
     Ok(build_struct_json_patch!(
         ialp_runtime::RuntimeGenesisConfig {
@@ -138,7 +142,12 @@ fn genesis_patch(loaded: &LoadedDomainConfig) -> Result<Value, String> {
                 epoch_length_blocks,
             },
             transfers: pallet_ialp_transfers::GenesisConfig {
+                importer_account: Some(importer_account.clone()),
+            },
+            governance: pallet_ialp_governance::GenesisConfig {
+                protocol_version: 1,
                 importer_account: Some(importer_account),
+                governance_voters,
             },
         }
     ))

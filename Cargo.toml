@@ -10,6 +10,7 @@ members = [
     "chain/node",
     "chain/pallets/domain",
     "chain/pallets/epochs",
+    "chain/pallets/governance",
     "chain/pallets/transfers",
     "chain/runtime",
     "crates/common-config",
@@ -48,6 +49,7 @@ ialp-common-types = { path = "./crates/common-types", default-features = false }
 ialp-runtime = { path = "./chain/runtime", default-features = false }
 pallet-ialp-domain = { path = "./chain/pallets/domain", default-features = false }
 pallet-ialp-epochs = { path = "./chain/pallets/epochs", default-features = false }
+pallet-ialp-governance = { path = "./chain/pallets/governance", default-features = false }
 pallet-ialp-transfers = { path = "./chain/pallets/transfers", default-features = false }
 
 anyhow = "1.0.95"

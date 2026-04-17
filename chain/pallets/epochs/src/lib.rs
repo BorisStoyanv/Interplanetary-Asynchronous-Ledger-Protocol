@@ -8,10 +8,9 @@ pub mod pallet {
     use frame_support::{pallet_prelude::*, traits::Get};
     use frame_system::pallet_prelude::*;
     use ialp_common_types::{
-        empty_commitment_root, event_envelope_hash, fold_epoch_accumulator, seed_epoch_accumulator,
-        tx_envelope_hash, DomainId, EpochId, EpochSummaryHashInput, EpochSummaryHeader,
-        StagedSummaryRecord, BLOCK_ROOT_LABEL, EMPTY_HASH, EPOCH_SUMMARY_VERSION, EVENT_ROOT_LABEL,
-        GOVERNANCE_ROOT_EMPTY_LABEL, TX_ROOT_LABEL,
+        event_envelope_hash, fold_epoch_accumulator, seed_epoch_accumulator, tx_envelope_hash,
+        DomainId, EpochId, EpochSummaryHashInput, EpochSummaryHeader, StagedSummaryRecord,
+        BLOCK_ROOT_LABEL, EMPTY_HASH, EPOCH_SUMMARY_VERSION, EVENT_ROOT_LABEL, TX_ROOT_LABEL,
     };
     use scale_info::TypeInfo;
     use sp_runtime::{
@@ -35,6 +34,14 @@ pub mod pallet {
 
     pub trait ImportCommitmentProvider {
         fn commit_epoch_imports(
+            epoch_id: EpochId,
+            start_block_height: u32,
+            end_block_height: u32,
+        ) -> [u8; 32];
+    }
+
+    pub trait GovernanceCommitmentProvider {
+        fn commit_epoch_governance(
             epoch_id: EpochId,
             start_block_height: u32,
             end_block_height: u32,
@@ -90,6 +97,7 @@ pub mod pallet {
         type SummaryContext: SummaryContext<Self::Hash>;
         type ExportCommitmentProvider: ExportCommitmentProvider;
         type ImportCommitmentProvider: ImportCommitmentProvider;
+        type GovernanceCommitmentProvider: GovernanceCommitmentProvider;
     }
 
     #[pallet::pallet]
@@ -272,6 +280,11 @@ pub mod pallet {
                 start_height,
                 end_height,
             );
+            let governance_root = T::GovernanceCommitmentProvider::commit_epoch_governance(
+                epoch_id,
+                start_height,
+                end_height,
+            );
 
             SummarySlots::<T>::mutate(epoch_id, |maybe_slot| {
                 let Some(slot) = maybe_slot else {
@@ -295,13 +308,7 @@ pub mod pallet {
                     event_root: slot.accumulators.event_root,
                     export_root,
                     import_root,
-                    governance_root: empty_commitment_root(
-                        GOVERNANCE_ROOT_EMPTY_LABEL,
-                        domain_id,
-                        epoch_id,
-                        start_height,
-                        end_height,
-                    ),
+                    governance_root,
                     validator_set_hash,
                 });
 
@@ -348,8 +355,8 @@ pub mod pallet {
             observation: &PendingBlockObservation,
         ) {
             // The accumulator inputs stay intentionally small and deterministic in Phase 1A.
-            // Proof-grade roots for transfers/imports/governance are deferred, but the contract is
-            // already fixed now so later phases extend commitments without redefining the header.
+            // Proof-grade roots for transfers/imports/governance evolve independently through
+            // provider hooks while the header contract stays fixed.
             let block_hash =
                 T::SummaryContext::hash_to_bytes(&frame_system::Pallet::<T>::parent_hash());
             slot.accumulators.state_root = observation.state_root;

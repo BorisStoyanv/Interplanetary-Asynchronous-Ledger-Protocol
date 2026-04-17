@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(name = "ialp-scenario-harness")]
-#[command(about = "Phase 3B end-to-end scenario harness for IALP multi-domain flows.")]
+#[command(about = "End-to-end scenario harness for IALP multi-domain settlement and governance flows.")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -24,6 +24,7 @@ pub enum ScenarioArg {
     EarthToMarsDelay,
     EarthToMarsBlackout,
     EarthToMoonRelayRestart,
+    EarthToMoonGovernanceActivation,
 }
 
 #[derive(Debug, Clone, Args)]

@@ -163,6 +163,9 @@ mod runtime {
 
     #[runtime::pallet_index(9)]
     pub type Transfers = pallet_ialp_transfers;
+
+    #[runtime::pallet_index(10)]
+    pub type Governance = pallet_ialp_governance;
 }
 
 const NORMAL_DISPATCH_RATIO: Perbill = Perbill::from_percent(75);
@@ -305,11 +308,26 @@ impl pallet_ialp_epochs::ImportCommitmentProvider for EpochImportCommitmentRunti
     }
 }
 
+pub struct EpochGovernanceCommitmentRuntimeProvider;
+
+impl pallet_ialp_epochs::GovernanceCommitmentProvider
+    for EpochGovernanceCommitmentRuntimeProvider
+{
+    fn commit_epoch_governance(
+        epoch_id: ialp_common_types::EpochId,
+        start_block_height: u32,
+        end_block_height: u32,
+    ) -> [u8; 32] {
+        Governance::commit_epoch_governance(epoch_id, start_block_height, end_block_height)
+    }
+}
+
 impl pallet_ialp_epochs::Config for Runtime {
     type RuntimeEvent = RuntimeEvent;
     type SummaryContext = EpochSummaryRuntimeContext;
     type ExportCommitmentProvider = EpochExportCommitmentRuntimeProvider;
     type ImportCommitmentProvider = EpochImportCommitmentRuntimeProvider;
+    type GovernanceCommitmentProvider = EpochGovernanceCommitmentRuntimeProvider;
 }
 
 pub struct TransferDomainIdentityRuntimeProvider;
@@ -334,4 +352,27 @@ impl pallet_ialp_transfers::Config for Runtime {
     type RuntimeHoldReason = RuntimeHoldReason;
     type DomainIdentity = TransferDomainIdentityRuntimeProvider;
     type EpochInfo = TransferEpochInfoRuntimeProvider;
+}
+
+pub struct GovernanceDomainIdentityRuntimeProvider;
+
+impl pallet_ialp_governance::DomainIdentityProvider for GovernanceDomainIdentityRuntimeProvider {
+    fn domain_id() -> ialp_common_types::DomainId {
+        Domain::domain_id()
+    }
+}
+
+pub struct GovernanceEpochInfoRuntimeProvider;
+
+impl pallet_ialp_governance::EpochInfoProvider for GovernanceEpochInfoRuntimeProvider {
+    fn current_epoch() -> ialp_common_types::EpochId {
+        Epochs::current_epoch()
+    }
+}
+
+impl pallet_ialp_governance::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type Currency = Balances;
+    type DomainIdentity = GovernanceDomainIdentityRuntimeProvider;
+    type EpochInfo = GovernanceEpochInfoRuntimeProvider;
 }

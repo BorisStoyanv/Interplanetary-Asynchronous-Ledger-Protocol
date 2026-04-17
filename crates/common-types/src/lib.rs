@@ -34,16 +34,27 @@ pub const EXPORT_INCLUSION_PROOF_VERSION: u16 = 1;
 pub const FINALIZED_IMPORT_LEAF_VERSION: u16 = 1;
 pub const FINALIZED_IMPORT_INCLUSION_PROOF_VERSION: u16 = 1;
 pub const REMOTE_FINALIZATION_CLAIM_VERSION: u16 = 1;
+pub const GOVERNANCE_PAYLOAD_VERSION: u16 = 1;
+pub const GOVERNANCE_PROPOSAL_VERSION: u16 = 1;
+pub const GOVERNANCE_VOTE_VERSION: u16 = 1;
+pub const GOVERNANCE_ACK_RECORD_VERSION: u16 = 1;
+pub const GOVERNANCE_ACTIVATION_RECORD_VERSION: u16 = 1;
+pub const GOVERNANCE_PROPOSAL_LEAF_VERSION: u16 = 1;
+pub const GOVERNANCE_ACK_LEAF_VERSION: u16 = 1;
+pub const GOVERNANCE_INCLUSION_PROOF_VERSION: u16 = 1;
 pub const SUMMARY_HEADERS_PROOF_INDEX: usize = 0;
 pub const EXPORT_PROOF_START_INDEX: usize = 1;
 pub const EXPORT_MERKLE_NODE_LABEL: &str = "IALP:export-merkle-node:v1";
 pub const EXPORT_MERKLE_EMPTY_LABEL: &str = "IALP:export-merkle-empty:v1";
 pub const IMPORT_MERKLE_NODE_LABEL: &str = "IALP:import-merkle-node:v1";
 pub const IMPORT_MERKLE_EMPTY_LABEL: &str = "IALP:import-merkle-empty:v1";
+pub const GOVERNANCE_MERKLE_NODE_LABEL: &str = "IALP:governance-merkle-node:v1";
+pub const GOVERNANCE_MERKLE_EMPTY_LABEL: &str = "IALP:governance-merkle-empty:v1";
 pub const RELAY_PACKAGE_ENVELOPE_VERSION: u16 = 1;
 
 pub type ExportId = [u8; 32];
 pub type AccountIdBytes = [u8; 32];
+pub type GovernanceProposalId = [u8; 32];
 
 #[derive(
     Clone,
@@ -624,6 +635,432 @@ impl ObservedImportRecord {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum GovernancePayload {
+    SetProtocolVersion { new_version: u32 },
+}
+
+impl GovernancePayload {
+    pub fn payload_hash(&self) -> [u8; 32] {
+        blake2_256(&(GOVERNANCE_PAYLOAD_VERSION, self).encode())
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        match self {
+            Self::SetProtocolVersion { new_version } => *new_version,
+        }
+    }
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    TypeInfo,
+    MaxEncodedLen,
+    Default,
+)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum GovernanceVoteChoice {
+    #[default]
+    Yes,
+    No,
+    Abstain,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    TypeInfo,
+    MaxEncodedLen,
+    Default,
+)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum GovernanceProposalStatus {
+    #[default]
+    Created,
+    Voting,
+    Rejected,
+    LocallyFinalized,
+    Scheduled,
+    Activated,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct GovernanceVote {
+    pub version: u16,
+    pub proposal_id: GovernanceProposalId,
+    pub voter: AccountIdBytes,
+    pub choice: GovernanceVoteChoice,
+    pub voting_power: u128,
+    pub cast_epoch: EpochId,
+    pub cast_block_height: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct GovernanceProposal {
+    pub version: u16,
+    pub proposal_id: GovernanceProposalId,
+    pub source_domain: DomainId,
+    pub target_domains: Vec<DomainId>,
+    pub proposer: AccountIdBytes,
+    pub payload: GovernancePayload,
+    pub payload_hash: [u8; 32],
+    pub created_epoch: EpochId,
+    pub voting_start_epoch: EpochId,
+    pub voting_end_epoch: EpochId,
+    pub approval_epoch: Option<EpochId>,
+    pub activation_epoch: EpochId,
+    pub snapshot_total_voting_power: u128,
+    pub quorum_numerator: u32,
+    pub quorum_denominator: u32,
+    pub yes_voting_power: u128,
+    pub no_voting_power: u128,
+    pub abstain_voting_power: u128,
+    pub status: GovernanceProposalStatus,
+}
+
+impl Default for GovernanceProposal {
+    fn default() -> Self {
+        Self {
+            version: GOVERNANCE_PROPOSAL_VERSION,
+            proposal_id: EMPTY_HASH,
+            source_domain: DomainId::Earth,
+            target_domains: Vec::new(),
+            proposer: [0u8; 32],
+            payload: GovernancePayload::SetProtocolVersion { new_version: 1 },
+            payload_hash: EMPTY_HASH,
+            created_epoch: 0,
+            voting_start_epoch: 0,
+            voting_end_epoch: 0,
+            approval_epoch: None,
+            activation_epoch: 0,
+            snapshot_total_voting_power: 0,
+            quorum_numerator: 1,
+            quorum_denominator: 2,
+            yes_voting_power: 0,
+            no_voting_power: 0,
+            abstain_voting_power: 0,
+            status: GovernanceProposalStatus::Created,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct GovernanceAckRecord {
+    pub version: u16,
+    pub proposal_id: GovernanceProposalId,
+    pub source_domain: DomainId,
+    pub acknowledging_domain: DomainId,
+    pub target_domains: Vec<DomainId>,
+    pub activation_epoch: EpochId,
+    pub payload_hash: [u8; 32],
+    pub new_protocol_version: u32,
+    pub acknowledged_epoch: EpochId,
+    pub acknowledged_at_local_block_height: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct GovernanceActivationRecord {
+    pub version: u16,
+    pub proposal_id: GovernanceProposalId,
+    pub source_domain: DomainId,
+    pub target_domains: Vec<DomainId>,
+    pub payload_hash: [u8; 32],
+    pub new_protocol_version: u32,
+    pub activation_epoch: EpochId,
+    pub known_ack_domains: Vec<DomainId>,
+    pub scheduled_at_epoch: Option<EpochId>,
+    pub activated_at_epoch: Option<EpochId>,
+    pub activated_at_local_block_height: Option<u32>,
+    pub status: GovernanceProposalStatus,
+}
+
+impl Default for GovernanceActivationRecord {
+    fn default() -> Self {
+        Self {
+            version: GOVERNANCE_ACTIVATION_RECORD_VERSION,
+            proposal_id: EMPTY_HASH,
+            source_domain: DomainId::Earth,
+            target_domains: Vec::new(),
+            payload_hash: EMPTY_HASH,
+            new_protocol_version: 1,
+            activation_epoch: 0,
+            known_ack_domains: Vec::new(),
+            scheduled_at_epoch: None,
+            activated_at_epoch: None,
+            activated_at_local_block_height: None,
+            status: GovernanceProposalStatus::LocallyFinalized,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ImportedGovernanceProposalClaim {
+    pub version: u16,
+    pub leaf: GovernanceProposalLeaf,
+    pub summary_hash: [u8; 32],
+    pub package_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ImportedGovernanceAckClaim {
+    pub version: u16,
+    pub leaf: GovernanceAckLeaf,
+    pub summary_hash: [u8; 32],
+    pub package_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct GovernanceProposalLeafHashInput {
+    pub version: u16,
+    pub proposal_id: GovernanceProposalId,
+    pub source_domain: DomainId,
+    pub target_domain: DomainId,
+    pub target_domains: Vec<DomainId>,
+    pub proposer: AccountIdBytes,
+    pub payload_hash: [u8; 32],
+    pub new_protocol_version: u32,
+    pub created_epoch: EpochId,
+    pub voting_start_epoch: EpochId,
+    pub voting_end_epoch: EpochId,
+    pub approval_epoch: EpochId,
+    pub activation_epoch: EpochId,
+}
+
+impl GovernanceProposalLeafHashInput {
+    pub fn leaf_hash(&self) -> [u8; 32] {
+        blake2_256(&self.encode())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct GovernanceProposalLeaf {
+    pub version: u16,
+    pub proposal_id: GovernanceProposalId,
+    pub source_domain: DomainId,
+    pub target_domain: DomainId,
+    pub target_domains: Vec<DomainId>,
+    pub proposer: AccountIdBytes,
+    pub payload_hash: [u8; 32],
+    pub new_protocol_version: u32,
+    pub created_epoch: EpochId,
+    pub voting_start_epoch: EpochId,
+    pub voting_end_epoch: EpochId,
+    pub approval_epoch: EpochId,
+    pub activation_epoch: EpochId,
+    pub leaf_hash: [u8; 32],
+}
+
+impl GovernanceProposalLeaf {
+    pub fn from_hash_input(input: GovernanceProposalLeafHashInput) -> Self {
+        let leaf_hash = input.leaf_hash();
+        Self {
+            version: input.version,
+            proposal_id: input.proposal_id,
+            source_domain: input.source_domain,
+            target_domain: input.target_domain,
+            target_domains: input.target_domains,
+            proposer: input.proposer,
+            payload_hash: input.payload_hash,
+            new_protocol_version: input.new_protocol_version,
+            created_epoch: input.created_epoch,
+            voting_start_epoch: input.voting_start_epoch,
+            voting_end_epoch: input.voting_end_epoch,
+            approval_epoch: input.approval_epoch,
+            activation_epoch: input.activation_epoch,
+            leaf_hash,
+        }
+    }
+
+    pub fn hash_input(&self) -> GovernanceProposalLeafHashInput {
+        GovernanceProposalLeafHashInput {
+            version: self.version,
+            proposal_id: self.proposal_id,
+            source_domain: self.source_domain,
+            target_domain: self.target_domain,
+            target_domains: self.target_domains.clone(),
+            proposer: self.proposer,
+            payload_hash: self.payload_hash,
+            new_protocol_version: self.new_protocol_version,
+            created_epoch: self.created_epoch,
+            voting_start_epoch: self.voting_start_epoch,
+            voting_end_epoch: self.voting_end_epoch,
+            approval_epoch: self.approval_epoch,
+            activation_epoch: self.activation_epoch,
+        }
+    }
+
+    pub fn compute_leaf_hash(&self) -> [u8; 32] {
+        self.hash_input().leaf_hash()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct GovernanceAckLeafHashInput {
+    pub version: u16,
+    pub proposal_id: GovernanceProposalId,
+    pub source_domain: DomainId,
+    pub target_domain: DomainId,
+    pub acknowledging_domain: DomainId,
+    pub target_domains: Vec<DomainId>,
+    pub payload_hash: [u8; 32],
+    pub new_protocol_version: u32,
+    pub activation_epoch: EpochId,
+    pub acknowledged_epoch: EpochId,
+}
+
+impl GovernanceAckLeafHashInput {
+    pub fn leaf_hash(&self) -> [u8; 32] {
+        blake2_256(&self.encode())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct GovernanceAckLeaf {
+    pub version: u16,
+    pub proposal_id: GovernanceProposalId,
+    pub source_domain: DomainId,
+    pub target_domain: DomainId,
+    pub acknowledging_domain: DomainId,
+    pub target_domains: Vec<DomainId>,
+    pub payload_hash: [u8; 32],
+    pub new_protocol_version: u32,
+    pub activation_epoch: EpochId,
+    pub acknowledged_epoch: EpochId,
+    pub leaf_hash: [u8; 32],
+}
+
+impl GovernanceAckLeaf {
+    pub fn from_hash_input(input: GovernanceAckLeafHashInput) -> Self {
+        let leaf_hash = input.leaf_hash();
+        Self {
+            version: input.version,
+            proposal_id: input.proposal_id,
+            source_domain: input.source_domain,
+            target_domain: input.target_domain,
+            acknowledging_domain: input.acknowledging_domain,
+            target_domains: input.target_domains,
+            payload_hash: input.payload_hash,
+            new_protocol_version: input.new_protocol_version,
+            activation_epoch: input.activation_epoch,
+            acknowledged_epoch: input.acknowledged_epoch,
+            leaf_hash,
+        }
+    }
+
+    pub fn hash_input(&self) -> GovernanceAckLeafHashInput {
+        GovernanceAckLeafHashInput {
+            version: self.version,
+            proposal_id: self.proposal_id,
+            source_domain: self.source_domain,
+            target_domain: self.target_domain,
+            acknowledging_domain: self.acknowledging_domain,
+            target_domains: self.target_domains.clone(),
+            payload_hash: self.payload_hash,
+            new_protocol_version: self.new_protocol_version,
+            activation_epoch: self.activation_epoch,
+            acknowledged_epoch: self.acknowledged_epoch,
+        }
+    }
+
+    pub fn compute_leaf_hash(&self) -> [u8; 32] {
+        self.hash_input().leaf_hash()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum GovernanceLeaf {
+    ProposalV1(GovernanceProposalLeaf),
+    AckV1(GovernanceAckLeaf),
+}
+
+impl Default for GovernanceLeaf {
+    fn default() -> Self {
+        Self::ProposalV1(GovernanceProposalLeaf::default())
+    }
+}
+
+impl GovernanceLeaf {
+    pub fn target_domain(&self) -> DomainId {
+        match self {
+            Self::ProposalV1(leaf) => leaf.target_domain,
+            Self::AckV1(leaf) => leaf.target_domain,
+        }
+    }
+
+    pub fn proposal_id(&self) -> GovernanceProposalId {
+        match self {
+            Self::ProposalV1(leaf) => leaf.proposal_id,
+            Self::AckV1(leaf) => leaf.proposal_id,
+        }
+    }
+
+    pub fn leaf_hash(&self) -> [u8; 32] {
+        match self {
+            Self::ProposalV1(leaf) => leaf.leaf_hash,
+            Self::AckV1(leaf) => leaf.leaf_hash,
+        }
+    }
+
+    pub fn compute_leaf_hash(&self) -> [u8; 32] {
+        match self {
+            Self::ProposalV1(leaf) => leaf.compute_leaf_hash(),
+            Self::AckV1(leaf) => leaf.compute_leaf_hash(),
+        }
+    }
+
+    fn ordering_domain(&self) -> DomainId {
+        match self {
+            Self::ProposalV1(leaf) => leaf.source_domain,
+            Self::AckV1(leaf) => leaf.acknowledging_domain,
+        }
+    }
+
+    fn kind_order(&self) -> u8 {
+        match self {
+            Self::ProposalV1(_) => 0,
+            Self::AckV1(_) => 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct GovernanceInclusionProof {
+    pub version: u16,
+    pub leaf: GovernanceLeaf,
+    pub leaf_index: u32,
+    pub leaf_count: u32,
+    pub siblings: Vec<[u8; 32]>,
+}
+
 pub fn summary_header_storage_key(epoch_id: EpochId) -> Vec<u8> {
     storage_map_key(b"Epochs", b"SummaryHeaders", &epoch_id.encode())
 }
@@ -646,6 +1083,45 @@ pub fn epoch_finalized_import_ids_storage_key(epoch_id: EpochId) -> Vec<u8> {
 
 pub fn importer_account_storage_key() -> Vec<u8> {
     storage_value_key(b"Transfers", b"ImporterAccount")
+}
+
+pub fn governance_protocol_version_storage_key() -> Vec<u8> {
+    storage_value_key(b"Governance", b"ProtocolVersion")
+}
+
+pub fn governance_importer_account_storage_key() -> Vec<u8> {
+    storage_value_key(b"Governance", b"ImporterAccount")
+}
+
+pub fn governance_voters_storage_key() -> Vec<u8> {
+    storage_value_key(b"Governance", b"GovernanceVoters")
+}
+
+pub fn governance_proposal_storage_key(proposal_id: GovernanceProposalId) -> Vec<u8> {
+    storage_map_key(b"Governance", b"ProposalsById", &proposal_id.encode())
+}
+
+pub fn governance_activation_record_storage_key(proposal_id: GovernanceProposalId) -> Vec<u8> {
+    storage_map_key(b"Governance", b"ActivationRecordsById", &proposal_id.encode())
+}
+
+pub fn governance_ack_record_storage_key(
+    proposal_id: GovernanceProposalId,
+    acknowledging_domain: DomainId,
+) -> Vec<u8> {
+    storage_map_key(
+        b"Governance",
+        b"AckRecordsByKey",
+        &(proposal_id, acknowledging_domain).encode(),
+    )
+}
+
+pub fn epoch_governance_leaf_ids_storage_key(epoch_id: EpochId) -> Vec<u8> {
+    storage_map_key(b"Governance", b"EpochGovernanceLeafIds", &epoch_id.encode())
+}
+
+pub fn governance_leaf_storage_key(leaf_hash: [u8; 32]) -> Vec<u8> {
+    storage_map_key(b"Governance", b"GovernanceLeavesById", &leaf_hash.encode())
 }
 
 #[derive(
@@ -909,6 +1385,7 @@ pub enum InclusionProof {
     SummaryHeaderStorageV1(SummaryHeaderStorageProof),
     ExportV1(ExportInclusionProof),
     FinalizedImportV1(FinalizedImportInclusionProof),
+    GovernanceV1(GovernanceInclusionProof),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo, Default)]
@@ -1016,6 +1493,44 @@ impl CertifiedSummaryPackage {
         bundle: SummaryCertificationBundle,
         export_proofs: Vec<ExportInclusionProof>,
     ) -> Self {
+        Self::from_bundle_with_mixed_proofs(header, bundle, export_proofs, Vec::new(), Vec::new())
+    }
+
+    pub fn from_bundle_with_finalized_import_proofs(
+        header: EpochSummaryHeader,
+        bundle: SummaryCertificationBundle,
+        finalized_import_proofs: Vec<FinalizedImportInclusionProof>,
+    ) -> Self {
+        Self::from_bundle_with_mixed_proofs(
+            header,
+            bundle,
+            Vec::new(),
+            finalized_import_proofs,
+            Vec::new(),
+        )
+    }
+
+    pub fn from_bundle_with_governance_proofs(
+        header: EpochSummaryHeader,
+        bundle: SummaryCertificationBundle,
+        governance_proofs: Vec<GovernanceInclusionProof>,
+    ) -> Self {
+        Self::from_bundle_with_mixed_proofs(
+            header,
+            bundle,
+            Vec::new(),
+            Vec::new(),
+            governance_proofs,
+        )
+    }
+
+    pub fn from_bundle_with_mixed_proofs(
+        header: EpochSummaryHeader,
+        bundle: SummaryCertificationBundle,
+        export_proofs: Vec<ExportInclusionProof>,
+        finalized_import_proofs: Vec<FinalizedImportInclusionProof>,
+        governance_proofs: Vec<GovernanceInclusionProof>,
+    ) -> Self {
         let mut inclusion_proofs =
             vec![
                 InclusionProof::SummaryHeaderStorageV1(bundle.summary_header_storage_proof)
@@ -1027,23 +1542,16 @@ impl CertifiedSummaryPackage {
                 .map(InclusionProof::ExportV1)
                 .map(|proof| proof.encode()),
         );
-        Self::from_fields(header, bundle.certificate, inclusion_proofs, Vec::new())
-    }
-
-    pub fn from_bundle_with_finalized_import_proofs(
-        header: EpochSummaryHeader,
-        bundle: SummaryCertificationBundle,
-        finalized_import_proofs: Vec<FinalizedImportInclusionProof>,
-    ) -> Self {
-        let mut inclusion_proofs =
-            vec![
-                InclusionProof::SummaryHeaderStorageV1(bundle.summary_header_storage_proof)
-                    .encode(),
-            ];
         inclusion_proofs.extend(
             finalized_import_proofs
                 .into_iter()
                 .map(InclusionProof::FinalizedImportV1)
+                .map(|proof| proof.encode()),
+        );
+        inclusion_proofs.extend(
+            governance_proofs
+                .into_iter()
+                .map(InclusionProof::GovernanceV1)
                 .map(|proof| proof.encode()),
         );
         Self::from_fields(header, bundle.certificate, inclusion_proofs, Vec::new())
@@ -1072,6 +1580,13 @@ pub fn fixed_bytes<const N: usize>(value: &[u8]) -> [u8; N] {
 
 pub fn export_id(source_domain: DomainId, export_sequence: u64) -> ExportId {
     blake2_256(&(source_domain, export_sequence).encode())
+}
+
+pub fn governance_proposal_id(
+    source_domain: DomainId,
+    proposal_sequence: u64,
+) -> GovernanceProposalId {
+    blake2_256(&(source_domain, proposal_sequence).encode())
 }
 
 pub fn export_leaf_ordering(left: &ExportLeaf, right: &ExportLeaf) -> Ordering {
@@ -1454,6 +1969,173 @@ pub fn verify_finalized_import_inclusion_proof(
     hash == import_root
 }
 
+pub fn governance_leaf_ordering(left: &GovernanceLeaf, right: &GovernanceLeaf) -> Ordering {
+    left.target_domain()
+        .cmp(&right.target_domain())
+        .then(left.kind_order().cmp(&right.kind_order()))
+        .then(left.proposal_id().cmp(&right.proposal_id()))
+        .then(left.ordering_domain().cmp(&right.ordering_domain()))
+}
+
+pub fn sort_governance_leaves(leaves: &mut [GovernanceLeaf]) {
+    leaves.sort_by(governance_leaf_ordering);
+}
+
+pub fn governance_merkle_empty_root(
+    domain_id: DomainId,
+    epoch_id: EpochId,
+    start_block_height: u32,
+    end_block_height: u32,
+) -> [u8; 32] {
+    blake2_256(
+        &(
+            GOVERNANCE_MERKLE_EMPTY_LABEL,
+            domain_id,
+            epoch_id,
+            start_block_height,
+            end_block_height,
+        )
+            .encode(),
+    )
+}
+
+pub fn governance_merkle_parent_hash(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
+    blake2_256(&(GOVERNANCE_MERKLE_NODE_LABEL, left, right).encode())
+}
+
+pub fn governance_merkle_root(
+    domain_id: DomainId,
+    epoch_id: EpochId,
+    start_block_height: u32,
+    end_block_height: u32,
+    leaves: &[GovernanceLeaf],
+) -> [u8; 32] {
+    let mut ordered = leaves.to_vec();
+    sort_governance_leaves(&mut ordered);
+
+    if ordered.is_empty() {
+        return governance_merkle_empty_root(
+            domain_id,
+            epoch_id,
+            start_block_height,
+            end_block_height,
+        );
+    }
+
+    let mut level = ordered.iter().map(GovernanceLeaf::leaf_hash).collect::<Vec<_>>();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        let mut index = 0usize;
+        while index < level.len() {
+            let left = level[index];
+            let right = if index + 1 < level.len() {
+                level[index + 1]
+            } else {
+                left
+            };
+            next.push(governance_merkle_parent_hash(left, right));
+            index += 2;
+        }
+        level = next;
+    }
+
+    level[0]
+}
+
+pub fn build_governance_inclusion_proof(
+    leaves: &[GovernanceLeaf],
+    target_leaf_hash: [u8; 32],
+) -> Option<GovernanceInclusionProof> {
+    let mut ordered = leaves.to_vec();
+    sort_governance_leaves(&mut ordered);
+
+    let leaf_index = ordered
+        .iter()
+        .position(|leaf| leaf.leaf_hash() == target_leaf_hash)?;
+    let leaf_count = ordered.len();
+    let mut siblings = Vec::new();
+    let mut index = leaf_index;
+    let mut level = ordered.iter().map(GovernanceLeaf::leaf_hash).collect::<Vec<_>>();
+
+    while level.len() > 1 {
+        let sibling_index = if index % 2 == 0 {
+            if index + 1 < level.len() {
+                index + 1
+            } else {
+                index
+            }
+        } else {
+            index - 1
+        };
+        siblings.push(level[sibling_index]);
+
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        let mut pair_index = 0usize;
+        while pair_index < level.len() {
+            let left = level[pair_index];
+            let right = if pair_index + 1 < level.len() {
+                level[pair_index + 1]
+            } else {
+                left
+            };
+            next.push(governance_merkle_parent_hash(left, right));
+            pair_index += 2;
+        }
+        index /= 2;
+        level = next;
+    }
+
+    Some(GovernanceInclusionProof {
+        version: GOVERNANCE_INCLUSION_PROOF_VERSION,
+        leaf: ordered[leaf_index].clone(),
+        leaf_index: leaf_index as u32,
+        leaf_count: leaf_count as u32,
+        siblings,
+    })
+}
+
+pub fn verify_governance_inclusion_proof(
+    governance_root: [u8; 32],
+    proof: &GovernanceInclusionProof,
+) -> bool {
+    if proof.leaf.leaf_hash() != proof.leaf.compute_leaf_hash() {
+        return false;
+    }
+    if proof.leaf_count == 0 || proof.leaf_index >= proof.leaf_count {
+        return false;
+    }
+
+    let mut index = proof.leaf_index as usize;
+    let mut width = proof.leaf_count as usize;
+    let mut hash = proof.leaf.leaf_hash();
+
+    if width == 1 {
+        return hash == governance_root && proof.siblings.is_empty();
+    }
+
+    for sibling in &proof.siblings {
+        let sibling_hash = *sibling;
+        let is_right_duplicate = width % 2 == 1 && index == width - 1;
+        let (left, right) = if index.is_multiple_of(2) {
+            (
+                hash,
+                if is_right_duplicate {
+                    hash
+                } else {
+                    sibling_hash
+                },
+            )
+        } else {
+            (sibling_hash, hash)
+        };
+        hash = governance_merkle_parent_hash(left, right);
+        index /= 2;
+        width = width.div_ceil(2);
+    }
+
+    hash == governance_root
+}
+
 pub fn storage_value_key(pallet: &[u8], storage: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(32);
     key.extend_from_slice(&twox_128(pallet));
@@ -1591,6 +2273,53 @@ mod tests {
             source_block_height,
             extrinsic_index,
         })
+    }
+
+    fn sample_governance_proposal_leaf(
+        proposal_id: GovernanceProposalId,
+        target_domain: DomainId,
+    ) -> GovernanceLeaf {
+        GovernanceLeaf::ProposalV1(GovernanceProposalLeaf::from_hash_input(
+            GovernanceProposalLeafHashInput {
+                version: GOVERNANCE_PROPOSAL_LEAF_VERSION,
+                proposal_id,
+                source_domain: DomainId::Earth,
+                target_domain,
+                target_domains: vec![DomainId::Moon],
+                proposer: [44u8; 32],
+                payload_hash: GovernancePayload::SetProtocolVersion { new_version: 2 }
+                    .payload_hash(),
+                new_protocol_version: 2,
+                created_epoch: 7,
+                voting_start_epoch: 7,
+                voting_end_epoch: 8,
+                approval_epoch: 8,
+                activation_epoch: 12,
+            },
+        ))
+    }
+
+    fn sample_governance_ack_leaf(
+        proposal_id: GovernanceProposalId,
+        target_domain: DomainId,
+        acknowledging_domain: DomainId,
+        acknowledged_epoch: EpochId,
+    ) -> GovernanceLeaf {
+        GovernanceLeaf::AckV1(GovernanceAckLeaf::from_hash_input(
+            GovernanceAckLeafHashInput {
+                version: GOVERNANCE_ACK_LEAF_VERSION,
+                proposal_id,
+                source_domain: DomainId::Earth,
+                target_domain,
+                acknowledging_domain,
+                target_domains: vec![DomainId::Moon],
+                payload_hash: GovernancePayload::SetProtocolVersion { new_version: 2 }
+                    .payload_hash(),
+                new_protocol_version: 2,
+                activation_epoch: 12,
+                acknowledged_epoch,
+            },
+        ))
     }
 
     #[test]
@@ -1734,5 +2463,87 @@ mod tests {
         assert_eq!(package.header.domain_id, DomainId::Earth);
         assert_eq!(package.header.epoch_id, 7);
         assert_eq!(package.compute_package_hash(), package.package_hash);
+    }
+
+    #[test]
+    fn governance_root_is_deterministic_and_proof_verifies() {
+        let leaves = vec![
+            sample_governance_ack_leaf(
+                governance_proposal_id(DomainId::Earth, 0),
+                DomainId::Earth,
+                DomainId::Moon,
+                9,
+            ),
+            sample_governance_proposal_leaf(governance_proposal_id(DomainId::Earth, 0), DomainId::Moon),
+        ];
+        let root = governance_merkle_root(DomainId::Earth, 8, 41, 60, &leaves);
+        let same_root = governance_merkle_root(DomainId::Earth, 8, 41, 60, &leaves);
+        let proof = build_governance_inclusion_proof(
+            &leaves,
+            sample_governance_proposal_leaf(governance_proposal_id(DomainId::Earth, 0), DomainId::Moon)
+                .leaf_hash(),
+        )
+        .expect("governance proof");
+
+        assert_eq!(root, same_root);
+        assert!(verify_governance_inclusion_proof(root, &proof));
+    }
+
+    #[test]
+    fn mixed_family_package_order_remains_summary_export_import_governance() {
+        let header = EpochSummaryHeader::from_hash_input(sample_hash_input());
+        let bundle = SummaryCertificationBundle {
+            certificate: sample_certificate(),
+            summary_header_storage_proof: sample_storage_proof(),
+        };
+        let export_leaf = sample_export_leaf([71u8; 32], DomainId::Moon, 61, 0);
+        let import_leaf = FinalizedImportLeaf::from_hash_input(FinalizedImportLeafHashInput {
+            version: FINALIZED_IMPORT_LEAF_VERSION,
+            export_id: [72u8; 32],
+            source_domain: DomainId::Moon,
+            target_domain: DomainId::Earth,
+            recipient: [73u8; 32],
+            amount: 11,
+            source_epoch_id: 6,
+            summary_hash: [74u8; 32],
+            package_hash: [75u8; 32],
+        });
+        let governance_leaf = sample_governance_proposal_leaf(
+            governance_proposal_id(DomainId::Earth, 1),
+            DomainId::Moon,
+        );
+        let package = CertifiedSummaryPackage::from_bundle_with_mixed_proofs(
+            header,
+            bundle,
+            vec![build_export_inclusion_proof(core::slice::from_ref(&export_leaf), export_leaf.export_id)
+                .expect("export proof")],
+            vec![build_finalized_import_inclusion_proof(
+                core::slice::from_ref(&import_leaf),
+                import_leaf.export_id,
+            )
+            .expect("import proof")],
+            vec![build_governance_inclusion_proof(
+                core::slice::from_ref(&governance_leaf),
+                governance_leaf.leaf_hash(),
+            )
+            .expect("governance proof")],
+        );
+
+        assert!(matches!(
+            InclusionProof::decode(&mut &package.inclusion_proofs[0][..]).expect("summary"),
+            InclusionProof::SummaryHeaderStorageV1(_)
+        ));
+        assert!(matches!(
+            InclusionProof::decode(&mut &package.inclusion_proofs[1][..]).expect("export"),
+            InclusionProof::ExportV1(_)
+        ));
+        assert!(matches!(
+            InclusionProof::decode(&mut &package.inclusion_proofs[2][..]).expect("import"),
+            InclusionProof::FinalizedImportV1(_)
+        ));
+        assert!(matches!(
+            InclusionProof::decode(&mut &package.inclusion_proofs[3][..]).expect("governance"),
+            InclusionProof::GovernanceV1(_)
+        ));
     }
 }

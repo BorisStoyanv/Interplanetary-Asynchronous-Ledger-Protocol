@@ -1,11 +1,15 @@
 mod cli;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     net::TcpListener,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,17 +23,21 @@ use ialp_common_config::{
     LoadedDomainConfig, LoadedTransportConfig, TransportConfig,
 };
 use ialp_common_types::{
-    epoch_export_ids_storage_key, export_record_storage_key, observed_import_storage_key,
-    storage_map_key, storage_value_key, summary_header_storage_key, AccountIdBytes, DomainId,
-    EpochSummaryHeader, ExportId, ExportRecord, ExportStatus, ImportObservationStatus,
-    ObservedImportRecord,
+    epoch_export_ids_storage_key, export_record_storage_key, governance_ack_record_storage_key,
+    governance_proposal_id, governance_proposal_storage_key, governance_protocol_version_storage_key,
+    observed_import_storage_key, storage_map_key, storage_value_key, summary_header_storage_key,
+    AccountIdBytes, DomainId, EpochSummaryHeader, ExportId, ExportRecord, ExportStatus,
+    GovernanceAckRecord, GovernanceProposal, GovernanceProposalId, GovernanceProposalStatus,
+    ImportObservationStatus, ObservedImportRecord,
 };
 use jsonrpsee::{
     core::{client::ClientT, rpc_params},
     ws_client::{WsClient, WsClientBuilder},
 };
 use multiaddr::Multiaddr;
+use pallet_ialp_governance::Call as GovernanceCall;
 use pallet_ialp_transfers::Call as TransfersCall;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sp_core::{crypto::Ss58Codec, sr25519, Pair, H256};
@@ -93,6 +101,7 @@ async fn execute_run_all(args: RunAllArgs) -> anyhow::Result<()> {
         ScenarioKind::EarthToMarsDelay,
         ScenarioKind::EarthToMarsBlackout,
         ScenarioKind::EarthToMoonRelayRestart,
+        ScenarioKind::EarthToMoonGovernanceActivation,
     ];
 
     let mut summaries = Vec::with_capacity(scenarios.len());
@@ -132,6 +141,7 @@ enum ScenarioKind {
     EarthToMarsDelay,
     EarthToMarsBlackout,
     EarthToMoonRelayRestart,
+    EarthToMoonGovernanceActivation,
 }
 
 impl ScenarioKind {
@@ -141,6 +151,7 @@ impl ScenarioKind {
             Self::EarthToMarsDelay => "earth-to-mars-delay",
             Self::EarthToMarsBlackout => "earth-to-mars-blackout",
             Self::EarthToMoonRelayRestart => "earth-to-moon-relay-restart",
+            Self::EarthToMoonGovernanceActivation => "earth-to-moon-governance-activation",
         }
     }
 
@@ -150,7 +161,9 @@ impl ScenarioKind {
 
     fn target_domain(self) -> DomainId {
         match self {
-            Self::EarthToMoonSuccess | Self::EarthToMoonRelayRestart => DomainId::Moon,
+            Self::EarthToMoonSuccess
+            | Self::EarthToMoonRelayRestart
+            | Self::EarthToMoonGovernanceActivation => DomainId::Moon,
             Self::EarthToMarsDelay | Self::EarthToMarsBlackout => DomainId::Mars,
         }
     }
@@ -165,6 +178,7 @@ impl ScenarioKind {
             Self::EarthToMarsDelay => 20,
             Self::EarthToMarsBlackout => 2,
             Self::EarthToMoonRelayRestart => 15,
+            Self::EarthToMoonGovernanceActivation => 2,
         }
     }
 
@@ -192,6 +206,7 @@ impl ScenarioKind {
                 Self::EarthToMoonRelayRestart => 120,
                 Self::EarthToMarsDelay => 150,
                 Self::EarthToMarsBlackout => 180,
+                Self::EarthToMoonGovernanceActivation => 60,
             }),
             destination_remote_observed: Duration::from_secs(30),
             completion_exporter_certified_and_submitted: Duration::from_secs(90),
@@ -209,6 +224,7 @@ impl From<ScenarioArg> for ScenarioKind {
             ScenarioArg::EarthToMarsDelay => Self::EarthToMarsDelay,
             ScenarioArg::EarthToMarsBlackout => Self::EarthToMarsBlackout,
             ScenarioArg::EarthToMoonRelayRestart => Self::EarthToMoonRelayRestart,
+            ScenarioArg::EarthToMoonGovernanceActivation => Self::EarthToMoonGovernanceActivation,
         }
     }
 }
@@ -283,12 +299,18 @@ struct ScenarioSummary {
     source_epoch_id: Option<u64>,
     extrinsic_hash: Option<String>,
     export_ids: Vec<String>,
+    proposal_id: Option<String>,
+    activation_epoch: Option<u64>,
     summary_hash: Option<String>,
     package_hash: Option<String>,
     completion_package_hash: Option<String>,
     final_relay_state: Option<String>,
     final_importer_package_state: Option<ialp_common_types::ImporterPackageState>,
     destination_observation: Option<DestinationObservationEvidence>,
+    source_protocol_version_before: Option<u32>,
+    target_protocol_version_before: Option<u32>,
+    source_protocol_version_after: Option<u32>,
+    target_protocol_version_after: Option<u32>,
     stage_results: Vec<StageResult>,
     artifact_paths: ArtifactPaths,
 }
@@ -368,12 +390,18 @@ impl ScenarioRunner {
                 source_epoch_id: None,
                 extrinsic_hash: None,
                 export_ids: Vec::new(),
+                proposal_id: None,
+                activation_epoch: None,
                 summary_hash: None,
                 package_hash: None,
                 completion_package_hash: None,
                 final_relay_state: None,
                 final_importer_package_state: None,
                 destination_observation: None,
+                source_protocol_version_before: None,
+                target_protocol_version_before: None,
+                source_protocol_version_after: None,
+                target_protocol_version_after: None,
                 stage_results: Vec::new(),
                 artifact_paths: ArtifactPaths {
                     root: display_path(&layout.root),
@@ -408,6 +436,10 @@ impl ScenarioRunner {
         self.prepare_transport_config()?;
         self.start_services().await?;
         self.wait_for_services().await?;
+
+        if matches!(self.scenario, ScenarioKind::EarthToMoonGovernanceActivation) {
+            return self.run_governance_activation().await;
+        }
 
         let destination_rpc =
             ChainRpcClient::connect(&self.node_configs[&self.scenario.target_domain()].rpc_url())
@@ -949,6 +981,478 @@ impl ScenarioRunner {
             },
         )
         .await
+    }
+
+    async fn run_governance_activation(&mut self) -> anyhow::Result<()> {
+        let source_rpc =
+            ChainRpcClient::connect(&self.node_configs[&self.scenario.source_domain()].rpc_url())
+                .await?;
+        let target_rpc =
+            ChainRpcClient::connect(&self.node_configs[&self.scenario.target_domain()].rpc_url())
+                .await?;
+        self.summary.source_protocol_version_before = source_rpc.governance_protocol_version().await?;
+        self.summary.target_protocol_version_before = target_rpc.governance_protocol_version().await?;
+
+        let proposal = self.originate_governance_proposal().await?;
+        self.summary.proposal_id = Some(hex_hash(proposal.proposal_id));
+        self.summary.source_epoch_id = Some(proposal.approval_epoch);
+        self.summary.activation_epoch = Some(proposal.activation_epoch);
+
+        let summary_header = self
+            .wait_for_governance_epoch_commitment(proposal.approval_epoch)
+            .await?;
+        self.summary.summary_hash = Some(hex_hash(summary_header.summary_hash));
+
+        let exporter_record = self
+            .wait_for_governance_exporter_package(
+                self.scenario.source_domain(),
+                self.scenario.target_domain(),
+                Some(proposal.approval_epoch),
+            )
+            .await?;
+        self.summary.package_hash = exporter_record.package_hash.clone();
+
+        let relay_final = self.wait_for_relay_delivery().await?;
+        self.summary.final_relay_state = Some(relay_state_name(&relay_final.state).to_string());
+
+        let importer_record = self.wait_for_importer_terminal().await?;
+        self.summary.final_importer_package_state = Some(importer_record.state);
+        self.wait_for_target_governance_acceptance(proposal.proposal_id, proposal.activation_epoch)
+            .await?;
+
+        let ack_exporter_record = self
+            .wait_for_governance_exporter_package(
+                self.scenario.target_domain(),
+                self.scenario.source_domain(),
+                None,
+            )
+            .await?;
+        self.summary.completion_package_hash = ack_exporter_record.package_hash.clone();
+
+        let ack_relay_final = self.wait_for_completion_relay_delivery().await?;
+        self.summary.final_relay_state = Some(relay_state_name(&ack_relay_final.state).to_string());
+
+        let source_importer_record = self.wait_for_source_importer_terminal().await?;
+        self.summary.final_importer_package_state = Some(source_importer_record.state);
+        self.wait_for_source_governance_ack(proposal.proposal_id, proposal.activation_epoch)
+            .await?;
+        self.assert_protocol_versions_before_activation(proposal.proposal_id)
+            .await?;
+        self.wait_for_governance_activation(proposal.proposal_id, proposal.activation_epoch)
+            .await?;
+        self.replay_duplicate_governance_package(&relay_final).await?;
+        self.summary.success = true;
+        Ok(())
+    }
+
+    async fn originate_governance_proposal(&mut self) -> anyhow::Result<GovernanceProposalOutcome> {
+        let timeout = Duration::from_secs(120);
+        let earth_rpc =
+            ChainRpcClient::connect(&self.node_configs[&DomainId::Earth].rpc_url()).await?;
+        let earth_config = load_domain_config(
+            DomainId::Earth,
+            Some(&self.node_configs[&DomainId::Earth].config_path),
+        )?;
+        let alice_pair = sr25519::Pair::from_string("//Alice", None)
+            .map_err(|error| anyhow!("failed to load //Alice pair: {error}"))?;
+        let alice_account = submitter_account_id(&alice_pair);
+        let runtime = earth_rpc.runtime_metadata().await?;
+        let proposal_id = governance_proposal_id(DomainId::Earth, 0);
+
+        let create_nonce = earth_rpc.account_next_index(&alice_account).await?;
+        let create_extrinsic = build_governance_create_proposal_extrinsic(
+            &alice_pair,
+            alice_account.clone(),
+            runtime.spec_version,
+            runtime.transaction_version,
+            runtime.genesis_hash,
+            create_nonce,
+            vec![DomainId::Moon],
+            2,
+        )?;
+        let create_hash = earth_rpc.submit_extrinsic(&create_extrinsic).await?;
+        let _ = self
+            .wait_for_stage("governance_proposal_created", timeout, || async {
+                let proposal = earth_rpc.governance_proposal(proposal_id).await?;
+                let included = earth_rpc
+                    .find_finalized_extrinsic(create_hash, &create_extrinsic)
+                    .await?;
+                let details = json!({
+                    "proposal_id": hex_hash(proposal_id),
+                    "proposal": proposal.as_ref().map(governance_proposal_json),
+                    "included": included.as_ref().map(|value| json!({
+                        "block_number": value.block_number,
+                        "block_hash": hex_h256(value.block_hash),
+                    })),
+                });
+                match proposal {
+                    Some(proposal) if proposal.status == GovernanceProposalStatus::Voting => {
+                        StagePoll::ready((), details)
+                    }
+                    _ => StagePoll::pending(details),
+                }
+            })
+            .await?;
+
+        let vote_seeds = earth_config
+            .config
+            .bootstrap
+            .endowed_accounts
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for seed in vote_seeds {
+            let pair = sr25519::Pair::from_string(&seed, None)
+                .map_err(|error| anyhow!("failed to load governance voter {seed}: {error}"))?;
+            let account = submitter_account_id(&pair);
+            let nonce = earth_rpc.account_next_index(&account).await?;
+            earth_rpc
+                .submit_extrinsic(&build_governance_cast_vote_extrinsic(
+                    &pair,
+                    account,
+                    runtime.spec_version,
+                    runtime.transaction_version,
+                    runtime.genesis_hash,
+                    nonce,
+                    proposal_id,
+                    ialp_common_types::GovernanceVoteChoice::Yes,
+                )?)
+                .await?;
+        }
+        let _ = self
+            .wait_for_stage("governance_votes_recorded", timeout, || async {
+                let proposal = earth_rpc.governance_proposal(proposal_id).await?;
+                let details = json!({
+                    "proposal": proposal.as_ref().map(governance_proposal_json),
+                });
+                match proposal {
+                    Some(proposal) if proposal.yes_voting_power > 0 => {
+                        StagePoll::ready((), details)
+                    }
+                    _ => StagePoll::pending(details),
+                }
+            })
+            .await?;
+
+        let close_hash = {
+            let close_nonce = earth_rpc.account_next_index(&alice_account).await?;
+            let close_extrinsic = build_governance_close_proposal_extrinsic(
+                &alice_pair,
+                alice_account.clone(),
+                runtime.spec_version,
+                runtime.transaction_version,
+                runtime.genesis_hash,
+                close_nonce,
+                proposal_id,
+            )?;
+            let close_submitted = Arc::new(AtomicBool::new(false));
+            self.wait_for_stage("governance_proposal_finalized", timeout, || async {
+                let current_epoch = earth_rpc.current_epoch().await?.unwrap_or_default();
+                let proposal = earth_rpc.governance_proposal(proposal_id).await?;
+                if let Some(proposal) = proposal.as_ref() {
+                    if proposal.status == GovernanceProposalStatus::Voting
+                        && current_epoch >= proposal.voting_end_epoch
+                        && !close_submitted.load(Ordering::SeqCst)
+                    {
+                        earth_rpc.submit_extrinsic(&close_extrinsic).await?;
+                        close_submitted.store(true, Ordering::SeqCst);
+                    }
+                }
+                let details = json!({
+                    "current_epoch": current_epoch,
+                    "close_submitted": close_submitted.load(Ordering::SeqCst),
+                    "proposal": proposal.as_ref().map(governance_proposal_json),
+                });
+                match proposal {
+                    Some(proposal)
+                        if matches!(
+                            proposal.status,
+                            GovernanceProposalStatus::LocallyFinalized
+                                | GovernanceProposalStatus::Scheduled
+                                | GovernanceProposalStatus::Activated
+                        ) =>
+                    {
+                        StagePoll::ready(
+                            GovernanceProposalOutcome {
+                                proposal_id,
+                                approval_epoch: proposal.approval_epoch.unwrap_or_default(),
+                                activation_epoch: proposal.activation_epoch,
+                            },
+                            details,
+                        )
+                    }
+                    _ => StagePoll::pending(details),
+                }
+            })
+            .await?
+        };
+
+        Ok(close_hash)
+    }
+
+    async fn wait_for_governance_epoch_commitment(
+        &mut self,
+        epoch_id: u64,
+    ) -> anyhow::Result<EpochSummaryHeader> {
+        let earth_rpc =
+            ChainRpcClient::connect(&self.node_configs[&DomainId::Earth].rpc_url()).await?;
+        self.wait_for_stage("governance_summary_staged", Duration::from_secs(120), || async {
+            let summary = earth_rpc.summary_header(epoch_id).await?;
+            let details = json!({
+                "epoch_id": epoch_id,
+                "summary": summary.as_ref().map(|header| json!({
+                    "summary_hash": hex_hash(header.summary_hash),
+                    "governance_root": hex_hash(header.governance_root),
+                })),
+            });
+            match summary {
+                Some(header)
+                    if header.governance_root
+                        != ialp_common_types::governance_merkle_empty_root(
+                            header.domain_id,
+                            header.epoch_id,
+                            header.start_block_height,
+                            header.end_block_height,
+                        ) =>
+                {
+                    StagePoll::ready(header, details)
+                }
+                _ => StagePoll::pending(details),
+            }
+        })
+        .await
+    }
+
+    async fn wait_for_governance_exporter_package(
+        &mut self,
+        source_domain: DomainId,
+        target_domain: DomainId,
+        epoch_id: Option<u64>,
+    ) -> anyhow::Result<ialp_summary_exporter::store::PackageRecord> {
+        let exporter_store = ialp_summary_exporter::store::Store::new(
+            self.layout
+                .stores_dir
+                .join("exporter")
+                .join(source_domain.as_str()),
+            source_domain,
+        )?;
+        self.wait_for_stage(
+            "governance_exporter_certified_and_submitted",
+            Duration::from_secs(120),
+            || async {
+                let index = exporter_store.load_index()?;
+                let record = index
+                    .packages
+                    .iter()
+                    .find(|entry| {
+                        entry.target_domain == target_domain
+                            && epoch_id.map(|expected| entry.epoch_id == expected).unwrap_or(true)
+                    })
+                    .cloned();
+                let details = json!({
+                    "epoch_filter": epoch_id,
+                    "record": record.as_ref().map(|entry| entry.json_summary()),
+                    "packages": index.packages.iter().map(|entry| entry.json_summary()).collect::<Vec<_>>(),
+                });
+                match record {
+                    Some(record)
+                        if record.status == ialp_summary_exporter::store::PackageStatus::Certified
+                            && record.relay_submission_state
+                                == ialp_summary_exporter::store::RelaySubmissionState::Submitted
+                            && record.proof_kinds.iter().any(|kind| kind == "governance_v1") =>
+                    {
+                        StagePoll::ready(record, details)
+                    }
+                    _ => StagePoll::pending(details),
+                }
+            },
+        )
+        .await
+    }
+
+    async fn wait_for_target_governance_acceptance(
+        &mut self,
+        proposal_id: GovernanceProposalId,
+        activation_epoch: u64,
+    ) -> anyhow::Result<()> {
+        let target_rpc =
+            ChainRpcClient::connect(&self.node_configs[&self.scenario.target_domain()].rpc_url())
+                .await?;
+        let target_domain = self.scenario.target_domain();
+        self.wait_for_stage("target_governance_accepted", Duration::from_secs(120), || async {
+            let proposal = target_rpc.governance_proposal(proposal_id).await?;
+            let ack = target_rpc
+                .governance_ack_record(proposal_id, target_domain)
+                .await?;
+            let protocol_version = target_rpc.governance_protocol_version().await?;
+            let details = json!({
+                "proposal": proposal.as_ref().map(governance_proposal_json),
+                "ack": ack.as_ref().map(governance_ack_json),
+                "protocol_version": protocol_version,
+            });
+            match (proposal, ack, protocol_version) {
+                (Some(proposal), Some(_), Some(1))
+                    if proposal.activation_epoch == activation_epoch
+                        && matches!(
+                            proposal.status,
+                            GovernanceProposalStatus::Scheduled
+                                | GovernanceProposalStatus::LocallyFinalized
+                        ) =>
+                {
+                    StagePoll::ready((), details)
+                }
+                _ => StagePoll::pending(details),
+            }
+        })
+        .await
+    }
+
+    async fn wait_for_source_governance_ack(
+        &mut self,
+        proposal_id: GovernanceProposalId,
+        activation_epoch: u64,
+    ) -> anyhow::Result<()> {
+        let source_rpc =
+            ChainRpcClient::connect(&self.node_configs[&self.scenario.source_domain()].rpc_url())
+                .await?;
+        let target_domain = self.scenario.target_domain();
+        self.wait_for_stage("source_governance_ack_known", Duration::from_secs(120), || async {
+            let proposal = source_rpc.governance_proposal(proposal_id).await?;
+            let ack = source_rpc
+                .governance_ack_record(proposal_id, target_domain)
+                .await?;
+            let protocol_version = source_rpc.governance_protocol_version().await?;
+            let details = json!({
+                "proposal": proposal.as_ref().map(governance_proposal_json),
+                "ack": ack.as_ref().map(governance_ack_json),
+                "protocol_version": protocol_version,
+            });
+            match (proposal, ack, protocol_version) {
+                (Some(proposal), Some(_), Some(1))
+                    if proposal.activation_epoch == activation_epoch
+                        && proposal.status == GovernanceProposalStatus::Scheduled =>
+                {
+                    StagePoll::ready((), details)
+                }
+                _ => StagePoll::pending(details),
+            }
+        })
+        .await
+    }
+
+    async fn assert_protocol_versions_before_activation(
+        &mut self,
+        proposal_id: GovernanceProposalId,
+    ) -> anyhow::Result<()> {
+        let source_rpc =
+            ChainRpcClient::connect(&self.node_configs[&self.scenario.source_domain()].rpc_url())
+                .await?;
+        let target_rpc =
+            ChainRpcClient::connect(&self.node_configs[&self.scenario.target_domain()].rpc_url())
+                .await?;
+        let source_version = source_rpc.governance_protocol_version().await?.unwrap_or_default();
+        let target_version = target_rpc.governance_protocol_version().await?.unwrap_or_default();
+        let details = json!({
+            "proposal_id": hex_hash(proposal_id),
+            "source_protocol_version": source_version,
+            "target_protocol_version": target_version,
+        });
+        if source_version == 1 && target_version == 1 {
+            self.record_stage_success("protocol_versions_before_activation", details)?;
+            Ok(())
+        } else {
+            self.record_stage_failure("protocol_versions_before_activation", false, 0, None, details)?;
+            bail!("protocol version changed before scheduled activation")
+        }
+    }
+
+    async fn wait_for_governance_activation(
+        &mut self,
+        proposal_id: GovernanceProposalId,
+        activation_epoch: u64,
+    ) -> anyhow::Result<()> {
+        let source_rpc =
+            ChainRpcClient::connect(&self.node_configs[&self.scenario.source_domain()].rpc_url())
+                .await?;
+        let target_rpc =
+            ChainRpcClient::connect(&self.node_configs[&self.scenario.target_domain()].rpc_url())
+                .await?;
+        let (source_version, target_version) = self
+            .wait_for_stage("governance_activation", Duration::from_secs(180), || async {
+                let source_epoch = source_rpc.current_epoch().await?.unwrap_or_default();
+                let target_epoch = target_rpc.current_epoch().await?.unwrap_or_default();
+                let source_version = source_rpc.governance_protocol_version().await?.unwrap_or_default();
+                let target_version = target_rpc.governance_protocol_version().await?.unwrap_or_default();
+                let source_proposal = source_rpc.governance_proposal(proposal_id).await?;
+                let target_proposal = target_rpc.governance_proposal(proposal_id).await?;
+                let details = json!({
+                    "activation_epoch": activation_epoch,
+                    "source_epoch": source_epoch,
+                    "target_epoch": target_epoch,
+                    "source_protocol_version": source_version,
+                    "target_protocol_version": target_version,
+                    "source_proposal": source_proposal.as_ref().map(governance_proposal_json),
+                    "target_proposal": target_proposal.as_ref().map(governance_proposal_json),
+                });
+                match (&source_proposal, &target_proposal) {
+                    (Some(source), Some(target))
+                        if source.status == GovernanceProposalStatus::Activated
+                            && target.status == GovernanceProposalStatus::Activated
+                            && source_epoch >= activation_epoch
+                            && target_epoch >= activation_epoch
+                            && source_version == 2
+                            && target_version == 2 =>
+                    {
+                        StagePoll::ready((source_version, target_version), details)
+                    }
+                    _ => StagePoll::pending(details),
+                }
+            })
+            .await?;
+        self.summary.source_protocol_version_after = Some(source_version);
+        self.summary.target_protocol_version_after = Some(target_version);
+        Ok(())
+    }
+
+    async fn replay_duplicate_governance_package(
+        &mut self,
+        relay_record: &ialp_summary_relay::store::RelayPackageRecord,
+    ) -> anyhow::Result<()> {
+        let payload = fs::read(&relay_record.payload_path)
+            .with_context(|| format!("failed to read {}", relay_record.payload_path))?;
+        let importer_addr = self
+            .transport_config
+            .as_ref()
+            .and_then(|config| config.importers.get(&self.scenario.target_domain()))
+            .map(|config| config.listen_addr.clone())
+            .context("target importer config missing")?;
+        let response = Client::new()
+            .post(format!("http://{importer_addr}/api/v1/packages"))
+            .header("content-type", "application/octet-stream")
+            .body(payload)
+            .send()
+            .await
+            .context("failed to replay duplicate governance package")?;
+        let source_rpc =
+            ChainRpcClient::connect(&self.node_configs[&self.scenario.source_domain()].rpc_url())
+                .await?;
+        let target_rpc =
+            ChainRpcClient::connect(&self.node_configs[&self.scenario.target_domain()].rpc_url())
+                .await?;
+        let source_version = source_rpc.governance_protocol_version().await?.unwrap_or_default();
+        let target_version = target_rpc.governance_protocol_version().await?.unwrap_or_default();
+        let details = json!({
+            "http_status": response.status().as_u16(),
+            "source_protocol_version": source_version,
+            "target_protocol_version": target_version,
+        });
+        if response.status().is_success() && source_version == 2 && target_version == 2 {
+            self.record_stage_success("governance_duplicate_replay_safe", details)?;
+            Ok(())
+        } else {
+            self.record_stage_failure("governance_duplicate_replay_safe", false, 0, None, details)?;
+            bail!("duplicate governance package replay changed protocol state or importer rejected it")
+        }
     }
 
     async fn originate_transfer(&mut self) -> anyhow::Result<TransferOutcome> {
@@ -1952,6 +2456,13 @@ struct TransferOutcome {
     amount: u128,
 }
 
+#[derive(Clone, Copy)]
+struct GovernanceProposalOutcome {
+    proposal_id: GovernanceProposalId,
+    approval_epoch: u64,
+    activation_epoch: u64,
+}
+
 struct IncludedExtrinsic {
     block_number: u32,
     block_hash: H256,
@@ -2111,6 +2622,31 @@ impl ChainRpcClient {
             .await
     }
 
+    async fn governance_protocol_version(&self) -> anyhow::Result<Option<u32>> {
+        self.load_storage_value(governance_protocol_version_storage_key())
+            .await
+    }
+
+    async fn governance_proposal(
+        &self,
+        proposal_id: GovernanceProposalId,
+    ) -> anyhow::Result<Option<GovernanceProposal>> {
+        self.load_storage_value(governance_proposal_storage_key(proposal_id))
+            .await
+    }
+
+    async fn governance_ack_record(
+        &self,
+        proposal_id: GovernanceProposalId,
+        acknowledging_domain: DomainId,
+    ) -> anyhow::Result<Option<GovernanceAckRecord>> {
+        self.load_storage_value(governance_ack_record_storage_key(
+            proposal_id,
+            acknowledging_domain,
+        ))
+        .await
+    }
+
     async fn balance_holds(
         &self,
         account: ialp_runtime::AccountId,
@@ -2249,6 +2785,121 @@ fn build_transfer_extrinsic(
     Ok(extrinsic.encode())
 }
 
+fn build_governance_create_proposal_extrinsic(
+    submitter_pair: &sr25519::Pair,
+    account_id: ialp_runtime::AccountId,
+    spec_version: u32,
+    transaction_version: u32,
+    genesis_hash: H256,
+    nonce: u32,
+    target_domains: Vec<DomainId>,
+    new_protocol_version: u32,
+) -> anyhow::Result<Vec<u8>> {
+    let call = ialp_runtime::RuntimeCall::Governance(GovernanceCall::create_proposal {
+        target_domains,
+        new_protocol_version,
+    });
+    build_signed_extrinsic(
+        submitter_pair,
+        account_id,
+        spec_version,
+        transaction_version,
+        genesis_hash,
+        nonce,
+        call,
+    )
+}
+
+fn build_governance_cast_vote_extrinsic(
+    submitter_pair: &sr25519::Pair,
+    account_id: ialp_runtime::AccountId,
+    spec_version: u32,
+    transaction_version: u32,
+    genesis_hash: H256,
+    nonce: u32,
+    proposal_id: GovernanceProposalId,
+    choice: ialp_common_types::GovernanceVoteChoice,
+) -> anyhow::Result<Vec<u8>> {
+    let call = ialp_runtime::RuntimeCall::Governance(GovernanceCall::cast_vote {
+        proposal_id,
+        choice,
+    });
+    build_signed_extrinsic(
+        submitter_pair,
+        account_id,
+        spec_version,
+        transaction_version,
+        genesis_hash,
+        nonce,
+        call,
+    )
+}
+
+fn build_governance_close_proposal_extrinsic(
+    submitter_pair: &sr25519::Pair,
+    account_id: ialp_runtime::AccountId,
+    spec_version: u32,
+    transaction_version: u32,
+    genesis_hash: H256,
+    nonce: u32,
+    proposal_id: GovernanceProposalId,
+) -> anyhow::Result<Vec<u8>> {
+    let call = ialp_runtime::RuntimeCall::Governance(GovernanceCall::close_proposal {
+        proposal_id,
+    });
+    build_signed_extrinsic(
+        submitter_pair,
+        account_id,
+        spec_version,
+        transaction_version,
+        genesis_hash,
+        nonce,
+        call,
+    )
+}
+
+fn build_signed_extrinsic(
+    submitter_pair: &sr25519::Pair,
+    account_id: ialp_runtime::AccountId,
+    spec_version: u32,
+    transaction_version: u32,
+    genesis_hash: H256,
+    nonce: u32,
+    call: ialp_runtime::RuntimeCall,
+) -> anyhow::Result<Vec<u8>> {
+    let extra = (
+        frame_system::CheckNonZeroSender::<ialp_runtime::Runtime>::new(),
+        frame_system::CheckSpecVersion::<ialp_runtime::Runtime>::new(),
+        frame_system::CheckTxVersion::<ialp_runtime::Runtime>::new(),
+        frame_system::CheckGenesis::<ialp_runtime::Runtime>::new(),
+        frame_system::CheckEra::<ialp_runtime::Runtime>::from(Era::Immortal),
+        frame_system::CheckNonce::<ialp_runtime::Runtime>::from(nonce),
+        frame_system::CheckWeight::<ialp_runtime::Runtime>::new(),
+        pallet_transaction_payment::ChargeTransactionPayment::<ialp_runtime::Runtime>::from(0u128),
+        frame_system::WeightReclaim::<ialp_runtime::Runtime>::new(),
+    );
+    let implicit = (
+        (),
+        spec_version,
+        transaction_version,
+        genesis_hash,
+        genesis_hash,
+        (),
+        (),
+        (),
+        (),
+    );
+    let payload = ialp_runtime::SignedPayload::from_raw(call.clone(), extra.clone(), implicit);
+    let signature: MultiSignature = submitter_pair.sign(&payload.encode()).into();
+    let extrinsic = ialp_runtime::UncheckedExtrinsic::new_signed(
+        call,
+        MultiAddress::Id(account_id),
+        signature,
+        extra,
+    );
+    Ok(extrinsic.encode())
+}
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -2334,6 +2985,7 @@ async fn rebuild_workspace_packages(binary: &Path, packages: &[&str]) -> anyhow:
     command.env_remove("SKIP_WASM_BUILD");
     if let Some(toolchain_bin) = preferred_rustup_toolchain_bin_dir() {
         command.env("PATH", prepend_path_entry(&toolchain_bin)?);
+        command.env("RUSTC", toolchain_bin.join(binary_name("rustc")));
     }
     command.current_dir(workspace_root());
     let output = command
@@ -2641,6 +3293,32 @@ fn hex_hash(hash: [u8; 32]) -> String {
 
 fn hex_h256(hash: H256) -> String {
     format!("0x{}", hex::encode(hash.as_bytes()))
+}
+
+fn governance_proposal_json(proposal: &GovernanceProposal) -> serde_json::Value {
+    json!({
+        "proposal_id": hex_hash(proposal.proposal_id),
+        "source_domain": proposal.source_domain,
+        "target_domains": proposal.target_domains,
+        "created_epoch": proposal.created_epoch,
+        "voting_end_epoch": proposal.voting_end_epoch,
+        "approval_epoch": proposal.approval_epoch,
+        "activation_epoch": proposal.activation_epoch,
+        "yes_voting_power": proposal.yes_voting_power.to_string(),
+        "no_voting_power": proposal.no_voting_power.to_string(),
+        "status": proposal.status,
+    })
+}
+
+fn governance_ack_json(record: &GovernanceAckRecord) -> serde_json::Value {
+    json!({
+        "proposal_id": hex_hash(record.proposal_id),
+        "source_domain": record.source_domain,
+        "acknowledging_domain": record.acknowledging_domain,
+        "target_domains": record.target_domains,
+        "activation_epoch": record.activation_epoch,
+        "acknowledged_epoch": record.acknowledged_epoch,
+    })
 }
 
 fn display_path(path: &Path) -> String {

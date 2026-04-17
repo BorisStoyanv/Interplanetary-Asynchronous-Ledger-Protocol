@@ -3291,6 +3291,7 @@ dependencies = [
  "pallet-grandpa",
  "pallet-ialp-domain",
  "pallet-ialp-epochs",
+ "pallet-ialp-governance",
  "pallet-ialp-transfers",
  "pallet-transaction-payment-rpc",
  "parity-scale-codec",
@@ -3340,6 +3341,7 @@ dependencies = [
  "pallet-grandpa",
  "pallet-ialp-domain",
  "pallet-ialp-epochs",
+ "pallet-ialp-governance",
  "pallet-ialp-transfers",
  "pallet-sudo",
  "pallet-timestamp",
@@ -3383,9 +3385,11 @@ dependencies = [
  "jsonrpsee",
  "multiaddr 0.18.2",
  "pallet-balances",
+ "pallet-ialp-governance",
  "pallet-ialp-transfers",
  "pallet-transaction-payment",
  "parity-scale-codec",
+ "reqwest",
  "serde",
  "serde_json",
  "sp-core",
@@ -3431,6 +3435,7 @@ dependencies = [
  "ialp-common-types",
  "ialp-runtime",
  "jsonrpsee",
+ "pallet-ialp-governance",
  "pallet-ialp-transfers",
  "pallet-transaction-payment",
  "parity-scale-codec",
@@ -5560,6 +5565,24 @@ dependencies = [
  "sp-core",
  "sp-io",
  "sp-runtime",
+]
+
+[[package]]
+name = "pallet-ialp-governance"
+version = "0.1.0"
+dependencies = [
+ "frame-support",
+ "frame-system",
+ "ialp-common-types",
+ "pallet-balances",
+ "pallet-ialp-domain",
+ "pallet-ialp-epochs",
+ "parity-scale-codec",
+ "scale-info",
+ "sp-core",
+ "sp-io",
+ "sp-runtime",
+ "sp-std",
 ]
 
 [[package]]
